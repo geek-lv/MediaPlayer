@@ -1,4 +1,7 @@
 using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Threading;
 using Avalonia;
 using Avalonia.OpenGL;
 using Avalonia.OpenGL.Controls;
@@ -77,32 +80,17 @@ public sealed class GpuMediaPlayer : OpenGlControlBase, IDisposable
     private string _lastError = string.Empty;
     private long _lastRenderedFrameSequence = -1;
     private bool _disposed;
+    private int _renderRequestPending;
+    private int _timelineDispatchPending;
+    private int _playbackDispatchPending;
+    private int _errorDispatchPending;
+    private string _pendingErrorMessage = string.Empty;
 
     public GpuMediaPlayer()
     {
-        try
-        {
-            _backend = new LibVlcMediaBackend();
-            _activeDecodeApi = _backend.ActiveDecodeApi;
-            _activeRenderPath = _backend.ActiveRenderPath;
-        }
-        catch (Exception ex)
-        {
-            try
-            {
-                _backend = new FfmpegMediaBackend();
-                _activeDecodeApi = _backend.ActiveDecodeApi;
-                _activeRenderPath = _backend.ActiveRenderPath;
-                _lastError = $"Primary backend failed, fallback active: {ex.Message}";
-            }
-            catch (Exception fallbackEx)
-            {
-                _backend = new NullMediaBackend(fallbackEx.Message);
-                _activeDecodeApi = "Unavailable";
-                _activeRenderPath = "Unavailable";
-                _lastError = $"Primary backend failed: {ex.Message} | Fallback failed: {fallbackEx.Message}";
-            }
-        }
+        _backend = CreateBackendWithFallback(out _lastError);
+        _activeDecodeApi = _backend.ActiveDecodeApi;
+        _activeRenderPath = _backend.ActiveRenderPath;
 
         _backend.FrameReady += OnFrameReady;
         _backend.PlaybackStateChanged += OnPlaybackStateChanged;
@@ -197,7 +185,7 @@ public sealed class GpuMediaPlayer : OpenGlControlBase, IDisposable
     {
         EnsureNotDisposed();
         _backend.Play();
-        RequestNextFrameRendering();
+        RequestRender();
     }
 
     public void Pause()
@@ -210,14 +198,14 @@ public sealed class GpuMediaPlayer : OpenGlControlBase, IDisposable
     {
         EnsureNotDisposed();
         _backend.Stop();
-        RequestNextFrameRendering();
+        RequestRender();
     }
 
     public void Seek(TimeSpan position)
     {
         EnsureNotDisposed();
         _backend.Seek(position);
-        RequestNextFrameRendering();
+        RequestRender();
     }
 
     public void Dispose()
@@ -266,7 +254,7 @@ public sealed class GpuMediaPlayer : OpenGlControlBase, IDisposable
     protected override void OnOpenGlInit(GlInterface gl)
     {
         _renderer.Initialize(gl, GlVersion);
-        RequestNextFrameRendering();
+        RequestRender();
     }
 
     protected override void OnOpenGlDeinit(GlInterface gl)
@@ -277,12 +265,16 @@ public sealed class GpuMediaPlayer : OpenGlControlBase, IDisposable
     protected override void OnOpenGlLost()
     {
         _lastRenderedFrameSequence = -1;
+        _renderer.ResetFrameState();
         base.OnOpenGlLost();
     }
 
     protected override void OnOpenGlRender(GlInterface gl, int fb)
     {
-        EnsureNotDisposed();
+        if (_disposed)
+        {
+            return;
+        }
 
         var scale = VisualRoot?.RenderScaling ?? 1d;
         var pixelWidth = Math.Max(1, (int)(Bounds.Width * scale));
@@ -300,10 +292,7 @@ public sealed class GpuMediaPlayer : OpenGlControlBase, IDisposable
 
         _renderer.Render(gl, fb, pixelWidth, pixelHeight);
 
-        if (_backend.IsPlaying)
-        {
-            RequestNextFrameRendering();
-        }
+        // Rendering is event-driven from frame callbacks to avoid redraw loops when frame content doesn't change.
     }
 
     private void ApplySource(Uri? source)
@@ -312,10 +301,15 @@ public sealed class GpuMediaPlayer : OpenGlControlBase, IDisposable
         _lastRenderedFrameSequence = -1;
         VideoWidth = 0;
         VideoHeight = 0;
+        Position = TimeSpan.Zero;
+        Duration = TimeSpan.Zero;
+        IsPlaying = false;
+        _renderer.ResetFrameState();
 
         if (source is null)
         {
             _backend.Stop();
+            RequestRender();
             return;
         }
 
@@ -328,11 +322,24 @@ public sealed class GpuMediaPlayer : OpenGlControlBase, IDisposable
                 _backend.Play();
             }
 
-            RequestNextFrameRendering();
+            RequestRender();
         }
         catch (Exception ex)
         {
             LastError = ex.Message;
+            try
+            {
+                _backend.Stop();
+            }
+            catch
+            {
+                // Best effort cleanup after failed open.
+            }
+
+            IsPlaying = false;
+            Position = TimeSpan.Zero;
+            Duration = TimeSpan.Zero;
+            RequestRender();
         }
     }
 
@@ -343,7 +350,7 @@ public sealed class GpuMediaPlayer : OpenGlControlBase, IDisposable
             return;
         }
 
-        Dispatcher.UIThread.Post(RequestNextFrameRendering, DispatcherPriority.Render);
+        RequestRender();
     }
 
     private void OnPlaybackStateChanged(object? sender, EventArgs e)
@@ -353,8 +360,15 @@ public sealed class GpuMediaPlayer : OpenGlControlBase, IDisposable
             return;
         }
 
+        if (Interlocked.Exchange(ref _playbackDispatchPending, 1) != 0)
+        {
+            return;
+        }
+
         Dispatcher.UIThread.Post(() =>
         {
+            Interlocked.Exchange(ref _playbackDispatchPending, 0);
+
             if (_disposed)
             {
                 return;
@@ -363,7 +377,7 @@ public sealed class GpuMediaPlayer : OpenGlControlBase, IDisposable
             IsPlaying = _backend.IsPlaying;
             ActiveDecodeApi = _backend.ActiveDecodeApi;
             ActiveRenderPath = _backend.ActiveRenderPath;
-            RequestNextFrameRendering();
+            RequestRender();
         }, DispatcherPriority.Background);
     }
 
@@ -374,8 +388,15 @@ public sealed class GpuMediaPlayer : OpenGlControlBase, IDisposable
             return;
         }
 
+        if (Interlocked.Exchange(ref _timelineDispatchPending, 1) != 0)
+        {
+            return;
+        }
+
         Dispatcher.UIThread.Post(() =>
         {
+            Interlocked.Exchange(ref _timelineDispatchPending, 0);
+
             if (_disposed)
             {
                 return;
@@ -385,6 +406,7 @@ public sealed class GpuMediaPlayer : OpenGlControlBase, IDisposable
             Duration = _backend.Duration;
             VideoWidth = _backend.VideoWidth;
             VideoHeight = _backend.VideoHeight;
+            RequestRender();
         }, DispatcherPriority.Background);
     }
 
@@ -395,7 +417,89 @@ public sealed class GpuMediaPlayer : OpenGlControlBase, IDisposable
             return;
         }
 
-        Dispatcher.UIThread.Post(() => LastError = message, DispatcherPriority.Background);
+        _pendingErrorMessage = message;
+        if (Interlocked.Exchange(ref _errorDispatchPending, 1) != 0)
+        {
+            return;
+        }
+
+        Dispatcher.UIThread.Post(() =>
+        {
+            Interlocked.Exchange(ref _errorDispatchPending, 0);
+            if (_disposed)
+            {
+                return;
+            }
+
+            LastError = _pendingErrorMessage;
+        }, DispatcherPriority.Background);
+    }
+
+    private void RequestRender()
+    {
+        if (_disposed || Interlocked.Exchange(ref _renderRequestPending, 1) != 0)
+        {
+            return;
+        }
+
+        Dispatcher.UIThread.Post(() =>
+        {
+            Interlocked.Exchange(ref _renderRequestPending, 0);
+            if (_disposed)
+            {
+                return;
+            }
+
+            RequestNextFrameRendering();
+        }, DispatcherPriority.Render);
+    }
+
+    private static IMediaBackend CreateBackendWithFallback(out string initializationMessage)
+    {
+        var failures = new List<string>();
+
+        foreach (var candidate in EnumerateBackendCandidates())
+        {
+            try
+            {
+                var backend = candidate.Factory();
+                initializationMessage = failures.Count == 0
+                    ? string.Empty
+                    : $"Backend fallback active ({candidate.Name}). Previous failures: {string.Join(" | ", failures)}";
+                return backend;
+            }
+            catch (Exception ex)
+            {
+                failures.Add($"{candidate.Name}: {ex.Message}");
+            }
+        }
+
+        initializationMessage = failures.Count == 0
+            ? "No backend candidates available."
+            : $"All backends failed: {string.Join(" | ", failures)}";
+        return new NullMediaBackend(initializationMessage);
+    }
+
+    private static IEnumerable<(string Name, Func<IMediaBackend> Factory)> EnumerateBackendCandidates()
+    {
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+        {
+            yield return ("macOS Native Interop", static () => new MacOsNativeMediaBackend());
+            yield return ("LibVLC", static () => new LibVlcMediaBackend());
+            yield return ("FFmpeg fallback", static () => new FfmpegMediaBackend());
+            yield break;
+        }
+
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            yield return ("Windows Native Interop", static () => new WindowsNativeMediaBackend());
+            yield return ("LibVLC", static () => new LibVlcMediaBackend());
+            yield return ("FFmpeg fallback", static () => new FfmpegMediaBackend());
+            yield break;
+        }
+
+        yield return ("LibVLC", static () => new LibVlcMediaBackend());
+        yield return ("FFmpeg fallback", static () => new FfmpegMediaBackend());
     }
 
     private void EnsureNotDisposed()

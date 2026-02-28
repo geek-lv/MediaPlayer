@@ -383,13 +383,10 @@ internal sealed class LibVlcMediaBackend : IMediaBackend
             throw new ArgumentException("FourCC must contain exactly 4 characters.", nameof(fourCc));
         }
 
-        Span<byte> bytes = stackalloc byte[4];
-        bytes[0] = (byte)fourCc[0];
-        bytes[1] = (byte)fourCc[1];
-        bytes[2] = (byte)fourCc[2];
-        bytes[3] = (byte)fourCc[3];
-
-        Marshal.Copy(bytes.ToArray(), 0, chroma, 4);
+        Marshal.WriteByte(chroma, 0, (byte)fourCc[0]);
+        Marshal.WriteByte(chroma, 1, (byte)fourCc[1]);
+        Marshal.WriteByte(chroma, 2, (byte)fourCc[2]);
+        Marshal.WriteByte(chroma, 3, (byte)fourCc[3]);
     }
 
     private void OnPlaybackStateChanged(object? sender, EventArgs e)

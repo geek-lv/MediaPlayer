@@ -10,7 +10,7 @@ using System.Threading.Tasks;
 
 namespace MediaPlayer.Controls.Backends;
 
-internal sealed class FfmpegMediaBackend : IMediaBackend
+internal class FfmpegMediaBackend : IMediaBackend
 {
     private readonly object _frameGate = new();
     private readonly object _stateGate = new();
@@ -35,9 +35,25 @@ internal sealed class FfmpegMediaBackend : IMediaBackend
     private bool _isPlaying;
     private long _latestFrameSequence;
     private readonly bool _ffplayAvailable;
+    private readonly FfmpegBackendProfile _profile;
+    private DecodeMode _decodeMode;
+    private bool _cpuFallbackApplied;
+
+    private enum DecodeMode
+    {
+        Hardware,
+        Software
+    }
 
     public FfmpegMediaBackend()
+        : this(FfmpegBackendProfiles.GenericFallback())
     {
+    }
+
+    protected FfmpegMediaBackend(FfmpegBackendProfile profile)
+    {
+        _profile = profile;
+        _decodeMode = profile.SupportsHardwareAcceleration ? DecodeMode.Hardware : DecodeMode.Software;
         _ffplayAvailable = IsToolAvailable("ffplay");
     }
 
@@ -46,13 +62,22 @@ internal sealed class FfmpegMediaBackend : IMediaBackend
     public event EventHandler? TimelineChanged;
     public event EventHandler<string>? ErrorOccurred;
 
-    public string ActiveProfileName => RuntimeInformation.IsOSPlatform(OSPlatform.OSX) ? "macOS (FFmpeg fallback)" : "FFmpeg fallback";
+    public string ActiveProfileName => _profile.ProfileName;
 
-    public string ActiveDecodeApi => RuntimeInformation.IsOSPlatform(OSPlatform.OSX)
-        ? "VideoToolbox (ffmpeg hwaccel auto)"
-        : "FFmpeg hwaccel auto";
+    public string ActiveDecodeApi
+    {
+        get
+        {
+            lock (_stateGate)
+            {
+                return _decodeMode == DecodeMode.Hardware
+                    ? _profile.HardwareDecodeApi
+                    : _profile.SoftwareDecodeApi;
+            }
+        }
+    }
 
-    public string ActiveRenderPath => "ffmpeg raw BGRA frames -> Avalonia OpenGL texture";
+    public string ActiveRenderPath => _profile.RenderPath;
 
     public bool IsPlaying
     {
@@ -118,8 +143,17 @@ internal sealed class FfmpegMediaBackend : IMediaBackend
         }
 
         _source = source;
-        _duration = duration;
-        _position = TimeSpan.Zero;
+        lock (_stateGate)
+        {
+            _duration = duration;
+            _position = TimeSpan.Zero;
+            _positionAtPlayStart = TimeSpan.Zero;
+            _playbackStartedUtc = DateTime.UtcNow;
+            _isPlaying = false;
+            _decodeMode = _profile.SupportsHardwareAcceleration ? DecodeMode.Hardware : DecodeMode.Software;
+            _cpuFallbackApplied = false;
+        }
+
         _frameWidth = width;
         _frameHeight = height;
         _frameStride = width * 4;
@@ -290,7 +324,7 @@ internal sealed class FfmpegMediaBackend : IMediaBackend
         _videoProcess = null;
         _audioProcess = null;
 
-        if (_decodeTask is not null)
+        if (_decodeTask is not null && _decodeTask.Id != Task.CurrentId)
         {
             try
             {
@@ -329,8 +363,20 @@ internal sealed class FfmpegMediaBackend : IMediaBackend
         psi.ArgumentList.Add("-hide_banner");
         psi.ArgumentList.Add("-loglevel");
         psi.ArgumentList.Add("error");
-        psi.ArgumentList.Add("-hwaccel");
-        psi.ArgumentList.Add("auto");
+
+        DecodeMode decodeModeSnapshot;
+        lock (_stateGate)
+        {
+            decodeModeSnapshot = _decodeMode;
+        }
+
+        if (decodeModeSnapshot == DecodeMode.Hardware)
+        {
+            foreach (var arg in _profile.HardwareAccelerationArgs)
+            {
+                psi.ArgumentList.Add(arg);
+            }
+        }
 
         if (startPosition > TimeSpan.Zero)
         {
@@ -410,12 +456,18 @@ internal sealed class FfmpegMediaBackend : IMediaBackend
         var frameBytes = checked(_frameStride * _frameHeight);
         var stream = process.StandardOutput.BaseStream;
         var scratch = new byte[frameBytes];
+        var framesDecoded = 0;
 
         while (!cancellationToken.IsCancellationRequested)
         {
             var read = await ReadExactlyAsync(stream, scratch, frameBytes, cancellationToken).ConfigureAwait(false);
             if (read < frameBytes)
             {
+                if (!cancellationToken.IsCancellationRequested && framesDecoded == 0 && TrySwitchToSoftwareDecode())
+                {
+                    return;
+                }
+
                 break;
             }
 
@@ -433,6 +485,7 @@ internal sealed class FfmpegMediaBackend : IMediaBackend
                 Monitor.Exit(_frameGate);
             }
 
+            framesDecoded++;
             FrameReady?.Invoke(this, EventArgs.Empty);
             TimelineChanged?.Invoke(this, EventArgs.Empty);
         }
@@ -481,6 +534,41 @@ internal sealed class FfmpegMediaBackend : IMediaBackend
         }
 
         return total;
+    }
+
+    private bool TrySwitchToSoftwareDecode()
+    {
+        Uri? source;
+        TimeSpan restartPosition;
+
+        lock (_stateGate)
+        {
+            if (!_profile.SupportsHardwareAcceleration
+                || _decodeMode != DecodeMode.Hardware
+                || _cpuFallbackApplied
+                || !_isPlaying
+                || _source is null)
+            {
+                return false;
+            }
+
+            _decodeMode = DecodeMode.Software;
+            _cpuFallbackApplied = true;
+
+            var current = Position;
+            _position = current;
+            _positionAtPlayStart = current;
+            _playbackStartedUtc = DateTime.UtcNow;
+            source = _source;
+            restartPosition = current;
+        }
+
+        StopProcesses(resetPosition: false);
+        StartProcesses(source, restartPosition);
+        ErrorOccurred?.Invoke(this, "Hardware decode path failed. Switched to CPU decode fallback.");
+        PlaybackStateChanged?.Invoke(this, EventArgs.Empty);
+        TimelineChanged?.Invoke(this, EventArgs.Empty);
+        return true;
     }
 
     private bool TryProbeSource(Uri source, out int width, out int height, out TimeSpan duration, out string error)
