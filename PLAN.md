@@ -32,6 +32,10 @@ Build a cross-platform Avalonia media player control with:
 2. Add frame pacing metrics and dropped-frame telemetry.
 3. Improve seek behavior and buffering UI feedback.
 4. Add subtitle and multi-audio track switching.
+5. Add true native interop backends for macOS/Windows and make them default:
+   - macOS native backend profile: VideoToolbox hardware decode with automatic CPU decode fallback.
+   - Windows native backend profile: D3D11VA hardware decode with automatic CPU decode fallback.
+   - Preserve no-airspace rendering by always presenting frames through Avalonia-owned GPU surface.
 
 ### Phase 3 (advanced optimization)
 1. Introduce optional zero-copy GPU interop path per backend where available.
@@ -40,4 +44,5 @@ Build a cross-platform Avalonia media player control with:
 
 ## Current Status
 - Phase 1 complete.
+- Native interop backend profiles for macOS and Windows implemented and integrated as defaults (with LibVLC/FFmpeg fallback chain retained).
 - Solution builds successfully on .NET 9.

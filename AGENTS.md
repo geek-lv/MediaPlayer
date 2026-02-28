@@ -31,10 +31,14 @@ The control must be embeddable in normal Avalonia layouts and support overlays (
   - Exposes control properties and transport methods.
 - `src/MediaPlayer.Controls/Backends/IMediaBackend.cs`
   - Backend contract.
+- `src/MediaPlayer.Controls/Backends/MacOsNativeMediaBackend.cs`
+  - macOS-native interop profile backend (VideoToolbox with CPU fallback).
+- `src/MediaPlayer.Controls/Backends/WindowsNativeMediaBackend.cs`
+  - Windows-native interop profile backend (D3D11VA with CPU fallback).
 - `src/MediaPlayer.Controls/Backends/LibVlcMediaBackend.cs`
   - Platform-aware LibVLC backend implementation.
 - `src/MediaPlayer.Controls/Backends/FfmpegMediaBackend.cs`
-  - Runtime fallback backend (used when LibVLC cannot initialize on host).
+  - Generic FFmpeg backend and base implementation used by native interop profile backends.
 - `src/MediaPlayer.Controls/Rendering/OpenGlVideoRenderer.cs`
   - GPU draw path for video frames.
 - `src/MediaPlayer.Demo/MainWindow.axaml`
@@ -42,12 +46,25 @@ The control must be embeddable in normal Avalonia layouts and support overlays (
 
 ## Platform Strategy
 
+### Backend Selection Order
+- macOS:
+  1. `MacOsNativeMediaBackend`
+  2. `LibVlcMediaBackend`
+  3. `FfmpegMediaBackend`
+- Windows:
+  1. `WindowsNativeMediaBackend`
+  2. `LibVlcMediaBackend`
+  3. `FfmpegMediaBackend`
+- Linux:
+  1. `LibVlcMediaBackend`
+  2. `FfmpegMediaBackend`
+
 ### Decode API Preference
 - Windows: Media Foundation + D3D11VA
 - macOS: AVFoundation / VideoToolbox
 - Linux: VAAPI / VDPAU (depends on system drivers)
 
-These are expressed via LibVLC options in `LibVlcPlatformProfileResolver`.
+These are expressed via native interop backend profiles and LibVLC profile metadata.
 
 ### Render Strategy
 - Decode callbacks deliver frames to control-owned buffers.
@@ -98,11 +115,23 @@ dotnet build MediaPlayer.sln
 dotnet run --project src/MediaPlayer.Demo/MediaPlayer.Demo.csproj
 ```
 
+### Renderer Selection (Demo)
+- Renderer preference can be selected with:
+  - CLI: `--renderer=auto|opengl|vulkan|metal|software`
+  - Environment: `MEDIAPLAYER_RENDERER=auto|opengl|vulkan|metal|software`
+  - macOS menu: `View -> Renderer` (saved for next launch)
+- Platform mapping:
+  - Windows: Vulkan mode is supported (`Win32RenderingMode.Vulkan`).
+  - Linux/X11: Vulkan mode is supported (`X11RenderingMode.Vulkan`).
+  - macOS: Avalonia.Native does not expose a Vulkan renderer mode; Vulkan preference maps to Metal/OpenGL/Software fallback order.
+- macOS `Auto` prefers Metal first, then falls back to OpenGL and Software.
+- Current playback-surface compatibility: `GpuMediaPlayer` uses `OpenGlControlBase`, so runtime renderer is coerced to an OpenGL-capable mode for reliable video rendering. Preferences are still stored and shown for future renderer-path work.
+
 ## Known Technical Tradeoff (Current)
 Current callback-based integration copies decoded frames into control-owned buffers before GPU upload.
 This preserves no-airspace behavior and broad compatibility, but is not a full zero-copy path.
 
-Audio controls in FFmpeg fallback mode are limited (volume/mute are not wired in-process).
+Audio controls in FFmpeg-based backends are limited (volume/mute are not wired in-process).
 
 ## Future Extension Path
 1. Add optional zero-copy GPU interop where backend and platform support it.
