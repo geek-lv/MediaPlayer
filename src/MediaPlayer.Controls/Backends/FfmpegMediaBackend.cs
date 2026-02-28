@@ -13,12 +13,16 @@ namespace MediaPlayer.Controls.Backends;
 internal class FfmpegMediaBackend : IMediaBackend
 {
     private readonly object _frameGate = new();
+    private readonly object _processGate = new();
     private readonly object _stateGate = new();
+    private static readonly bool s_canSuspendProcesses =
+        RuntimeInformation.IsOSPlatform(OSPlatform.OSX) || RuntimeInformation.IsOSPlatform(OSPlatform.Linux);
 
     private Process? _videoProcess;
     private Process? _audioProcess;
     private CancellationTokenSource? _decodeCts;
     private Task? _decodeTask;
+    private CancellationTokenSource? _previewCts;
     private byte[]? _frameBuffer;
     private GCHandle _pinnedFrameBuffer;
     private int _frameWidth;
@@ -38,6 +42,7 @@ internal class FfmpegMediaBackend : IMediaBackend
     private readonly FfmpegBackendProfile _profile;
     private DecodeMode _decodeMode;
     private bool _cpuFallbackApplied;
+    private bool _processesSuspended;
 
     private enum DecodeMode
     {
@@ -167,25 +172,35 @@ internal class FfmpegMediaBackend : IMediaBackend
     {
         ThrowIfDisposed();
 
-        if (_source is null)
-        {
-            ErrorOccurred?.Invoke(this, "No source loaded.");
-            return;
-        }
-
+        Uri? source;
+        TimeSpan startPosition;
         lock (_stateGate)
         {
+            source = _source;
             if (_isPlaying)
             {
                 return;
             }
 
+            if (source is null)
+            {
+                ErrorOccurred?.Invoke(this, "No source loaded.");
+                return;
+            }
+
+            startPosition = _position;
             _positionAtPlayStart = _position;
             _playbackStartedUtc = DateTime.UtcNow;
             _isPlaying = true;
         }
 
-        StartProcesses(_source, _position);
+        CancelPreviewFrameRequest();
+        if (!TryResumeProcesses())
+        {
+            StopProcesses(resetPosition: false);
+            StartProcesses(source, startPosition);
+        }
+
         PlaybackStateChanged?.Invoke(this, EventArgs.Empty);
     }
 
@@ -204,7 +219,11 @@ internal class FfmpegMediaBackend : IMediaBackend
             _isPlaying = false;
         }
 
-        StopProcesses(resetPosition: false);
+        if (!TrySuspendProcesses())
+        {
+            StopProcesses(resetPosition: false);
+        }
+
         TimelineChanged?.Invoke(this, EventArgs.Empty);
         PlaybackStateChanged?.Invoke(this, EventArgs.Empty);
     }
@@ -212,6 +231,7 @@ internal class FfmpegMediaBackend : IMediaBackend
     public void Stop()
     {
         ThrowIfDisposed();
+
         lock (_stateGate)
         {
             _isPlaying = false;
@@ -227,27 +247,47 @@ internal class FfmpegMediaBackend : IMediaBackend
     {
         ThrowIfDisposed();
 
-        if (_source is null)
+        Uri? source;
+        bool shouldRestartPlayback;
+        lock (_stateGate)
         {
-            return;
-        }
+            source = _source;
+            if (source is null)
+            {
+                return;
+            }
 
-        var duration = Duration;
-        var clamped = duration > TimeSpan.Zero
+            var duration = _duration;
+            var clamped = duration > TimeSpan.Zero
             ? TimeSpan.FromMilliseconds(Math.Clamp(position.TotalMilliseconds, 0, duration.TotalMilliseconds))
             : TimeSpan.FromMilliseconds(Math.Max(0, position.TotalMilliseconds));
 
-        lock (_stateGate)
-        {
             _position = clamped;
             _positionAtPlayStart = clamped;
             _playbackStartedUtc = DateTime.UtcNow;
+            shouldRestartPlayback = _isPlaying;
+            position = clamped;
         }
 
-        if (IsPlaying)
+        if (shouldRestartPlayback)
         {
             StopProcesses(resetPosition: false);
-            StartProcesses(_source, clamped);
+            StartProcesses(source, position);
+        }
+        else
+        {
+            var suspended = false;
+            lock (_processGate)
+            {
+                suspended = _processesSuspended;
+            }
+
+            if (suspended)
+            {
+                StopProcesses(resetPosition: false);
+            }
+
+            RequestPreviewFrame(source, position);
         }
 
         TimelineChanged?.Invoke(this, EventArgs.Empty);
@@ -297,38 +337,62 @@ internal class FfmpegMediaBackend : IMediaBackend
         }
 
         _disposed = true;
+        CancelPreviewFrameRequest();
         StopProcesses(resetPosition: false);
         ReleaseFrameBuffer();
     }
 
     private void StartProcesses(Uri source, TimeSpan startPosition)
     {
-        _decodeCts = new CancellationTokenSource();
-        _videoProcess = StartVideoProcess(source, startPosition);
-
-        if (_ffplayAvailable)
+        lock (_processGate)
         {
-            _audioProcess = TryStartAudioProcess(source, startPosition);
-        }
+            _processesSuspended = false;
+            var decodeCts = new CancellationTokenSource();
+            var videoProcess = StartVideoProcess(source, startPosition);
 
-        _decodeTask = Task.Run(() => ReadFramesLoopAsync(_videoProcess, _decodeCts.Token));
+            _decodeCts = decodeCts;
+            _videoProcess = videoProcess;
+
+            if (_ffplayAvailable)
+            {
+                _audioProcess = TryStartAudioProcess(source, startPosition);
+            }
+
+            _decodeTask = Task.Run(() => ReadFramesLoopAsync(videoProcess, decodeCts.Token));
+        }
     }
 
     private void StopProcesses(bool resetPosition)
     {
-        _decodeCts?.Cancel();
+        CancellationTokenSource? decodeCts;
+        Process? videoProcess;
+        Process? audioProcess;
+        Task? decodeTask;
 
-        KillProcess(_videoProcess);
-        KillProcess(_audioProcess);
+        lock (_processGate)
+        {
+            _processesSuspended = false;
+            decodeCts = _decodeCts;
+            videoProcess = _videoProcess;
+            audioProcess = _audioProcess;
+            decodeTask = _decodeTask;
 
-        _videoProcess = null;
-        _audioProcess = null;
+            _videoProcess = null;
+            _audioProcess = null;
+            _decodeTask = null;
+            _decodeCts = null;
+        }
 
-        if (_decodeTask is not null && _decodeTask.Id != Task.CurrentId)
+        CancelPreviewFrameRequest();
+        decodeCts?.Cancel();
+        KillProcess(videoProcess);
+        KillProcess(audioProcess);
+
+        if (decodeTask is not null && decodeTask.Id != Task.CurrentId)
         {
             try
             {
-                _decodeTask.Wait(TimeSpan.FromMilliseconds(40));
+                decodeTask.Wait(TimeSpan.FromMilliseconds(16));
             }
             catch
             {
@@ -336,9 +400,7 @@ internal class FfmpegMediaBackend : IMediaBackend
             }
         }
 
-        _decodeTask = null;
-        _decodeCts?.Dispose();
-        _decodeCts = null;
+        decodeCts?.Dispose();
 
         if (resetPosition)
         {
@@ -346,6 +408,162 @@ internal class FfmpegMediaBackend : IMediaBackend
             {
                 _position = TimeSpan.Zero;
             }
+        }
+    }
+
+    private bool TrySuspendProcesses()
+    {
+        if (!s_canSuspendProcesses)
+        {
+            return false;
+        }
+
+        lock (_processGate)
+        {
+            if (_processesSuspended)
+            {
+                return true;
+            }
+
+            if (_videoProcess is null || _videoProcess.HasExited)
+            {
+                return false;
+            }
+
+            if (!TrySignalProcess(_videoProcess, GetSuspendSignal()))
+            {
+                return false;
+            }
+
+            if (!TrySignalProcess(_audioProcess, GetSuspendSignal()))
+            {
+                TrySignalProcess(_videoProcess, GetResumeSignal());
+                return false;
+            }
+
+            _processesSuspended = true;
+            return true;
+        }
+    }
+
+    private bool TryResumeProcesses()
+    {
+        if (!s_canSuspendProcesses)
+        {
+            return false;
+        }
+
+        lock (_processGate)
+        {
+            if (!_processesSuspended)
+            {
+                return false;
+            }
+
+            if (!TrySignalProcess(_videoProcess, GetResumeSignal()))
+            {
+                _processesSuspended = false;
+                return false;
+            }
+
+            if (!TrySignalProcess(_audioProcess, GetResumeSignal()))
+            {
+                _processesSuspended = false;
+                return false;
+            }
+
+            _processesSuspended = false;
+            return true;
+        }
+    }
+
+    private void RequestPreviewFrame(Uri source, TimeSpan position)
+    {
+        if (_disposed || _frameWidth <= 0 || _frameHeight <= 0 || _frameStride <= 0)
+        {
+            return;
+        }
+
+        var cts = new CancellationTokenSource();
+        CancellationTokenSource? previous;
+        lock (_processGate)
+        {
+            previous = _previewCts;
+            _previewCts = cts;
+        }
+
+        previous?.Cancel();
+
+        _ = Task.Run(() => DecodePreviewFrame(source, position, cts.Token), cts.Token);
+    }
+
+    private void CancelPreviewFrameRequest()
+    {
+        CancellationTokenSource? previewCts;
+        lock (_processGate)
+        {
+            previewCts = _previewCts;
+            _previewCts = null;
+        }
+
+        previewCts?.Cancel();
+    }
+
+    private void DecodePreviewFrame(Uri source, TimeSpan position, CancellationToken cancellationToken)
+    {
+        Process? process = null;
+        try
+        {
+            if (cancellationToken.IsCancellationRequested || _disposed)
+            {
+                return;
+            }
+
+            process = StartPreviewProcess(source, position);
+            using var _ = cancellationToken.Register(static state => KillProcess((Process?)state), process);
+
+            var frameBytes = checked(_frameStride * _frameHeight);
+            var scratch = new byte[frameBytes];
+            var read = ReadExactlyAsync(process.StandardOutput.BaseStream, scratch, frameBytes, cancellationToken)
+                .GetAwaiter()
+                .GetResult();
+
+            if (read < frameBytes || cancellationToken.IsCancellationRequested || _disposed)
+            {
+                return;
+            }
+
+            Monitor.Enter(_frameGate);
+            try
+            {
+                if (_frameBuffer is not null)
+                {
+                    Buffer.BlockCopy(scratch, 0, _frameBuffer, 0, frameBytes);
+                    Interlocked.Increment(ref _latestFrameSequence);
+                }
+            }
+            finally
+            {
+                Monitor.Exit(_frameGate);
+            }
+
+            FrameReady?.Invoke(this, EventArgs.Empty);
+            TimelineChanged?.Invoke(this, EventArgs.Empty);
+        }
+        catch (OperationCanceledException)
+        {
+            // Ignore canceled preview seeks.
+        }
+        catch (Exception ex)
+        {
+            if (!cancellationToken.IsCancellationRequested)
+            {
+                ErrorOccurred?.Invoke(this, $"Preview frame decode failed: {ex.Message}");
+            }
+        }
+        finally
+        {
+            KillProcess(process);
         }
     }
 
@@ -363,6 +581,11 @@ internal class FfmpegMediaBackend : IMediaBackend
         psi.ArgumentList.Add("-hide_banner");
         psi.ArgumentList.Add("-loglevel");
         psi.ArgumentList.Add("error");
+        psi.ArgumentList.Add("-nostdin");
+        psi.ArgumentList.Add("-fflags");
+        psi.ArgumentList.Add("nobuffer");
+        psi.ArgumentList.Add("-flags");
+        psi.ArgumentList.Add("low_delay");
 
         DecodeMode decodeModeSnapshot;
         lock (_stateGate)
@@ -418,6 +641,63 @@ internal class FfmpegMediaBackend : IMediaBackend
         return process;
     }
 
+    private Process StartPreviewProcess(Uri source, TimeSpan position)
+    {
+        var psi = new ProcessStartInfo
+        {
+            FileName = "ffmpeg",
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true
+        };
+
+        psi.ArgumentList.Add("-hide_banner");
+        psi.ArgumentList.Add("-loglevel");
+        psi.ArgumentList.Add("error");
+        psi.ArgumentList.Add("-nostdin");
+        psi.ArgumentList.Add("-fflags");
+        psi.ArgumentList.Add("nobuffer");
+        psi.ArgumentList.Add("-flags");
+        psi.ArgumentList.Add("low_delay");
+
+        DecodeMode decodeModeSnapshot;
+        lock (_stateGate)
+        {
+            decodeModeSnapshot = _decodeMode;
+        }
+
+        if (decodeModeSnapshot == DecodeMode.Hardware)
+        {
+            foreach (var arg in _profile.HardwareAccelerationArgs)
+            {
+                psi.ArgumentList.Add(arg);
+            }
+        }
+
+        if (position > TimeSpan.Zero)
+        {
+            psi.ArgumentList.Add("-ss");
+            psi.ArgumentList.Add(position.TotalSeconds.ToString("0.###", CultureInfo.InvariantCulture));
+        }
+
+        psi.ArgumentList.Add("-i");
+        psi.ArgumentList.Add(source.IsFile ? source.LocalPath : source.ToString());
+        psi.ArgumentList.Add("-an");
+        psi.ArgumentList.Add("-sn");
+        psi.ArgumentList.Add("-dn");
+        psi.ArgumentList.Add("-frames:v");
+        psi.ArgumentList.Add("1");
+        psi.ArgumentList.Add("-f");
+        psi.ArgumentList.Add("rawvideo");
+        psi.ArgumentList.Add("-pix_fmt");
+        psi.ArgumentList.Add("rgba");
+        psi.ArgumentList.Add("pipe:1");
+
+        return Process.Start(psi)
+            ?? throw new InvalidOperationException("Unable to start ffmpeg preview process.");
+    }
+
     private Process? TryStartAudioProcess(Uri source, TimeSpan startPosition)
     {
         try
@@ -433,6 +713,7 @@ internal class FfmpegMediaBackend : IMediaBackend
 
             psi.ArgumentList.Add("-loglevel");
             psi.ArgumentList.Add("quiet");
+            psi.ArgumentList.Add("-nostdin");
             psi.ArgumentList.Add("-nodisp");
             psi.ArgumentList.Add("-autoexit");
 
@@ -711,6 +992,32 @@ internal class FfmpegMediaBackend : IMediaBackend
         }
     }
 
+    private static int GetSuspendSignal() => RuntimeInformation.IsOSPlatform(OSPlatform.OSX) ? 17 : 19;
+
+    private static int GetResumeSignal() => RuntimeInformation.IsOSPlatform(OSPlatform.OSX) ? 19 : 18;
+
+    private static bool TrySignalProcess(Process? process, int signal)
+    {
+        if (process is null)
+        {
+            return true;
+        }
+
+        try
+        {
+            if (process.HasExited)
+            {
+                return false;
+            }
+
+            return kill(process.Id, signal) == 0;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     private static void KillProcess(Process? process)
     {
         if (process is null)
@@ -735,6 +1042,9 @@ internal class FfmpegMediaBackend : IMediaBackend
             process.Dispose();
         }
     }
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int kill(int pid, int sig);
 
     private void ThrowIfDisposed()
     {
