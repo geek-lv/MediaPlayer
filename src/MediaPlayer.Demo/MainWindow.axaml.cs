@@ -25,16 +25,17 @@ public partial class MainWindow : Window
     private readonly DispatcherTimer _overlayIdleTimer;
     private readonly DispatcherTimer _timelineSeekTimer;
     private static readonly TimeSpan OverlayHideDelay = TimeSpan.FromSeconds(1.7);
-    private static readonly TimeSpan TimelineSeekIntervalFast = TimeSpan.FromMilliseconds(32);
-    private static readonly TimeSpan TimelineSeekIntervalSlow = TimeSpan.FromMilliseconds(140);
-    private const double TimelineSeekMinDeltaFastSeconds = 0.08d;
-    private const double TimelineSeekMinDeltaSlowSeconds = 0.45d;
+    private static readonly TimeSpan TimelineSeekIntervalFast = TimeSpan.FromMilliseconds(24);
+    private static readonly TimeSpan TimelineSeekIntervalSlow = TimeSpan.FromMilliseconds(60);
+    private const double TimelineSeekMinDeltaFastSeconds = 0.03d;
+    private const double TimelineSeekMinDeltaSlowSeconds = 0.08d;
     private bool _isTimelineDragging;
     private bool _isTimelineUpdating;
     private bool _overlayVisible = true;
     private bool _isPointerOverHud;
     private bool _wasPlaying;
     private bool _alwaysShowControls;
+    private bool _resumePlaybackAfterTimelineDrag;
     private readonly bool _isMacOs = RuntimeInformation.IsOSPlatform(OSPlatform.OSX);
     private ExtendClientAreaChromeHints _defaultChromeHints;
     private DateTime _lastOverlayInteractionUtc = DateTime.UtcNow;
@@ -61,6 +62,22 @@ public partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
+        TimelineSlider.AddHandler(
+            InputElement.PointerPressedEvent,
+            OnTimelinePointerPressed,
+            RoutingStrategies.Tunnel | RoutingStrategies.Bubble,
+            handledEventsToo: true);
+        TimelineSlider.AddHandler(
+            InputElement.PointerReleasedEvent,
+            OnTimelinePointerReleased,
+            RoutingStrategies.Tunnel | RoutingStrategies.Bubble,
+            handledEventsToo: true);
+        TimelineSlider.AddHandler(
+            InputElement.PointerCaptureLostEvent,
+            OnTimelinePointerCaptureLost,
+            RoutingStrategies.Tunnel | RoutingStrategies.Bubble,
+            handledEventsToo: true);
+
         DataContext = new MainWindowViewModel();
         _defaultChromeHints = ExtendClientAreaChromeHints;
 
@@ -71,6 +88,7 @@ public partial class MainWindow : Window
         _statusTimer.Start();
         _overlayIdleTimer.Start();
         Closed += OnClosed;
+        Deactivated += OnWindowDeactivated;
         AttachPointerWakeHandlers();
 
         LoadSource();
@@ -82,6 +100,7 @@ public partial class MainWindow : Window
     private void OnClosed(object? sender, EventArgs e)
     {
         DetachPointerWakeHandlers();
+        Deactivated -= OnWindowDeactivated;
         _statusTimer.Stop();
         _overlayIdleTimer.Stop();
         _timelineSeekTimer.Stop();
@@ -268,9 +287,19 @@ public partial class MainWindow : Window
             return;
         }
 
+        if (!e.GetCurrentPoint(slider).Properties.IsLeftButtonPressed)
+        {
+            return;
+        }
+
         _isTimelineDragging = true;
+        _resumePlaybackAfterTimelineDrag = IsSlowSeekBackend() && Player.IsPlaying;
+        if (_resumePlaybackAfterTimelineDrag)
+        {
+            Player.Pause();
+        }
+
         SetOverlayVisible(true);
-        e.Pointer.Capture(slider);
         _lastOverlayInteractionUtc = DateTime.UtcNow;
         _hasPendingTimelineSeek = false;
         _lastTimelineSeekSeconds = -1d;
@@ -279,51 +308,31 @@ public partial class MainWindow : Window
 
     private void OnTimelinePointerReleased(object? sender, PointerReleasedEventArgs e)
     {
-        if (sender is not Slider slider)
-        {
-            return;
-        }
-
-        if (_isTimelineDragging)
-        {
-            CommitTimelineSeek(slider.Value);
-        }
-
-        _isTimelineDragging = false;
-        _timelineSeekTimer.Stop();
-        _hasPendingTimelineSeek = false;
-        if (e.Pointer.Captured == slider)
-        {
-            e.Pointer.Capture(null);
-        }
-
-        ShowOverlayAndRestartIdleTimer();
+        EndTimelineDrag(commitSeek: true, e.Pointer);
     }
 
     private void OnTimelinePointerCaptureLost(object? sender, PointerCaptureLostEventArgs e)
     {
-        if (!_isTimelineDragging || sender is not Slider slider)
-        {
-            return;
-        }
-
-        _isTimelineDragging = false;
-        CommitTimelineSeek(slider.Value);
-        _timelineSeekTimer.Stop();
-        _hasPendingTimelineSeek = false;
-        ShowOverlayAndRestartIdleTimer();
+        EndTimelineDrag(commitSeek: true, e.Pointer);
     }
 
     private void OnTimelineValueChanged(object? sender, RangeBaseValueChangedEventArgs e)
     {
-        if (_isTimelineUpdating || !_isTimelineDragging || sender is not Slider slider)
+        if (_isTimelineUpdating || sender is not Slider slider)
         {
             return;
         }
 
         var clamped = ClampTimelineSeconds(slider.Value);
         ViewModel.SeekSeconds = clamped;
-        QueueTimelineSeek(clamped);
+        if (_isTimelineDragging)
+        {
+            QueueTimelineSeek(clamped);
+        }
+        else
+        {
+            CommitTimelineSeek(clamped);
+        }
     }
 
     private void SeekFromTimeline(double seconds)
@@ -395,13 +404,6 @@ public partial class MainWindow : Window
     {
         var clamped = ClampTimelineSeconds(seconds);
         _hasPendingTimelineSeek = false;
-
-        // Avoid duplicate final seek when the latest drag-tick already landed on the same target.
-        if (_lastTimelineSeekSeconds >= 0d && Math.Abs(_lastTimelineSeekSeconds - clamped) < 0.02d)
-        {
-            ViewModel.SeekSeconds = clamped;
-            return;
-        }
 
         SeekFromTimeline(clamped);
         _lastTimelineSeekSeconds = clamped;
@@ -684,6 +686,7 @@ public partial class MainWindow : Window
     {
         AddHandler(InputElement.PointerMovedEvent, OnGlobalPointerMoved, RoutingStrategies.Tunnel | RoutingStrategies.Bubble, true);
         AddHandler(InputElement.PointerPressedEvent, OnGlobalPointerPressed, RoutingStrategies.Tunnel | RoutingStrategies.Bubble, true);
+        AddHandler(InputElement.PointerReleasedEvent, OnGlobalPointerReleased, RoutingStrategies.Tunnel | RoutingStrategies.Bubble, true);
         AddHandler(InputElement.PointerWheelChangedEvent, OnGlobalPointerWheelChanged, RoutingStrategies.Tunnel | RoutingStrategies.Bubble, true);
         AddHandler(InputElement.PointerEnteredEvent, OnGlobalPointerEntered, RoutingStrategies.Tunnel | RoutingStrategies.Bubble, true);
     }
@@ -692,6 +695,7 @@ public partial class MainWindow : Window
     {
         RemoveHandler(InputElement.PointerMovedEvent, OnGlobalPointerMoved);
         RemoveHandler(InputElement.PointerPressedEvent, OnGlobalPointerPressed);
+        RemoveHandler(InputElement.PointerReleasedEvent, OnGlobalPointerReleased);
         RemoveHandler(InputElement.PointerWheelChangedEvent, OnGlobalPointerWheelChanged);
         RemoveHandler(InputElement.PointerEnteredEvent, OnGlobalPointerEntered);
     }
@@ -711,8 +715,56 @@ public partial class MainWindow : Window
         ShowOverlayAndRestartIdleTimer();
     }
 
+    private void OnGlobalPointerReleased(object? sender, PointerReleasedEventArgs e)
+    {
+        ShowOverlayAndRestartIdleTimer();
+        if (_isTimelineDragging && !e.GetCurrentPoint(this).Properties.IsLeftButtonPressed)
+        {
+            EndTimelineDrag(commitSeek: true, e.Pointer);
+        }
+    }
+
     private void OnGlobalPointerEntered(object? sender, PointerEventArgs e)
     {
+        ShowOverlayAndRestartIdleTimer();
+    }
+
+    private void OnWindowDeactivated(object? sender, EventArgs e)
+    {
+        EndTimelineDrag(commitSeek: true, null);
+    }
+
+    private void EndTimelineDrag(bool commitSeek, IPointer? pointer)
+    {
+        if (!_isTimelineDragging)
+        {
+            return;
+        }
+
+        if (commitSeek)
+        {
+            CommitTimelineSeek(TimelineSlider.Value);
+        }
+
+        _isTimelineDragging = false;
+        _timelineSeekTimer.Stop();
+        _hasPendingTimelineSeek = false;
+
+        try
+        {
+            pointer?.Capture(null);
+        }
+        catch
+        {
+            // Best effort.
+        }
+
+        if (_resumePlaybackAfterTimelineDrag)
+        {
+            Player.Play();
+            _resumePlaybackAfterTimelineDrag = false;
+        }
+
         ShowOverlayAndRestartIdleTimer();
     }
 

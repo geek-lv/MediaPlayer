@@ -306,10 +306,7 @@
                                 Theme="{StaticResource QuickTimeTimelineSliderTheme}"
                                 Minimum="0"
                                 Maximum="1"
-                                ValueChanged="OnTimelineValueChanged"
-                                PointerPressed="OnTimelinePointerPressed"
-                                PointerReleased="OnTimelinePointerReleased"
-                                PointerCaptureLost="OnTimelinePointerCaptureLost" />
+                                ValueChanged="OnTimelineValueChanged" />
                         <TextBlock Grid.Column="2"
                                    VerticalAlignment="Center"
                                    Foreground="#E3E3E3"
