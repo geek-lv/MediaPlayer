@@ -485,6 +485,7 @@ public sealed class GpuMediaPlayer : OpenGlControlBase, IDisposable
         if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
         {
             yield return ("macOS Native Interop", static () => new MacOsNativeMediaBackend());
+            yield return ("macOS FFmpeg native profile", static () => new MacOsFfmpegProfileMediaBackend());
             yield return ("LibVLC", static () => new LibVlcMediaBackend());
             yield return ("FFmpeg fallback", static () => new FfmpegMediaBackend());
             yield break;
@@ -493,6 +494,7 @@ public sealed class GpuMediaPlayer : OpenGlControlBase, IDisposable
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
             yield return ("Windows Native Interop", static () => new WindowsNativeMediaBackend());
+            yield return ("Windows FFmpeg native profile", static () => new WindowsFfmpegProfileMediaBackend());
             yield return ("LibVLC", static () => new LibVlcMediaBackend());
             yield return ("FFmpeg fallback", static () => new FfmpegMediaBackend());
             yield break;
