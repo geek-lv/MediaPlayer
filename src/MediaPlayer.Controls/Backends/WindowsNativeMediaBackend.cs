@@ -82,13 +82,24 @@ internal sealed class WindowsNativeMediaBackend : NativeFramePumpMediaBackend
         return psi;
     }
 
-    protected override ProcessStartInfo CreatePlaybackProcess(Uri source, TimeSpan startPosition)
+    protected override ProcessStartInfo CreatePlaybackProcess(
+        Uri source,
+        TimeSpan startPosition,
+        double playbackRate,
+        float volume,
+        bool muted)
     {
         var psi = CreateDotnetHelperProcess("play");
         psi.ArgumentList.Add("--source");
         psi.ArgumentList.Add(FormatMediaSource(source));
         psi.ArgumentList.Add("--start");
         psi.ArgumentList.Add(FormatSeconds(startPosition));
+        psi.ArgumentList.Add("--speed");
+        psi.ArgumentList.Add(playbackRate.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture));
+        psi.ArgumentList.Add("--volume");
+        psi.ArgumentList.Add(Math.Clamp(volume, 0f, 100f).ToString("0.###", System.Globalization.CultureInfo.InvariantCulture));
+        psi.ArgumentList.Add("--mute");
+        psi.ArgumentList.Add(muted ? "1" : "0");
         return psi;
     }
 
@@ -198,13 +209,16 @@ internal static class Program
 
             var command = args[0].Trim().ToLowerInvariant();
             var source = GetValue(args, "--source") ?? throw new InvalidOperationException("Missing --source argument.");
-            var start = ParseDouble(GetValue(args, "--start"));
-            var at = ParseDouble(GetValue(args, "--time"));
+            var start = ParseDouble(GetValue(args, "--start"), 0d);
+            var at = ParseDouble(GetValue(args, "--time"), 0d);
+            var speed = ParseDouble(GetValue(args, "--speed"), 1d);
+            var volume = ParseDouble(GetValue(args, "--volume"), 100d);
+            var muted = ParseBool(GetValue(args, "--mute"));
 
             return command switch
             {
                 "probe" => RunOnSta(() => Probe(source)),
-                "play" => RunOnSta(() => Play(source, start)),
+                "play" => RunOnSta(() => Play(source, start, speed, volume, muted)),
                 "frame" => RunOnSta(() => Frame(source, at)),
                 _ => throw new InvalidOperationException($"Unknown command: {command}")
             };
@@ -260,14 +274,14 @@ internal static class Program
         var width = Math.Max(1, player.NaturalVideoWidth);
         var height = Math.Max(1, player.NaturalVideoHeight);
         var duration = player.NaturalDuration.HasTimeSpan ? Math.Max(0, player.NaturalDuration.TimeSpan.TotalSeconds) : 0d;
-        var payload = JsonSerializer.Serialize(new { width, height, duration });
+        var payload = JsonSerializer.Serialize(new { width, height, duration, frameRate = 0d });
         Console.Out.Write(payload);
         Console.Out.Flush();
         player.Close();
         return 0;
     }
 
-    private static int Play(string source, double startSeconds)
+    private static int Play(string source, double startSeconds, double speed, double volume, bool muted)
     {
         using var player = CreatePlayer(source);
         WaitForOpen(player);
@@ -285,8 +299,16 @@ internal static class Program
             player.Position = TimeSpan.FromSeconds(startSeconds);
         }
 
+        if (speed > 0)
+        {
+            player.SpeedRatio = Math.Clamp(speed, 0.1d, 16d);
+        }
+
+        player.Volume = Math.Clamp(volume / 100d, 0d, 1d);
+        player.IsMuted = muted;
+
         player.Play();
-        var frameInterval = TimeSpan.FromMilliseconds(33);
+        var frameInterval = TimeSpan.FromMilliseconds(33 / Math.Max(0.1d, speed <= 0 ? 1d : speed));
         var stopwatch = Stopwatch.StartNew();
         var nextTick = TimeSpan.Zero;
         while (!ended)
@@ -429,16 +451,33 @@ internal static class Program
         return null;
     }
 
-    private static double ParseDouble(string? text)
+    private static double ParseDouble(string? text, double defaultValue)
     {
         if (string.IsNullOrWhiteSpace(text))
         {
-            return 0d;
+            return defaultValue;
         }
 
         return double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out var value)
             ? Math.Max(0d, value)
-            : 0d;
+            : defaultValue;
+    }
+
+    private static bool ParseBool(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return false;
+        }
+
+        return text.Trim().ToLowerInvariant() switch
+        {
+            "1" => true,
+            "true" => true,
+            "yes" => true,
+            "y" => true,
+            _ => false
+        };
     }
 }
 """;

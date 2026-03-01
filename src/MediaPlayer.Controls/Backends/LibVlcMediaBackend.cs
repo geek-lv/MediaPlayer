@@ -4,15 +4,19 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading;
 using LibVLCSharp.Shared;
+using LibVLCSharp.Shared.Structures;
 using LibVlcMediaPlayer = LibVLCSharp.Shared.MediaPlayer;
+using MediaPlayer.Controls.Audio;
 
 namespace MediaPlayer.Controls.Backends;
 
-internal sealed class LibVlcMediaBackend : IMediaBackend
+internal sealed class LibVlcMediaBackend : IMediaBackend, IMediaAudioCapabilityProvider, IMediaAudioPlaybackController, IMediaAudioDeviceController
 {
     private const int BufferAlignment = 32;
     private static readonly object s_coreInitLock = new();
     private static bool s_coreInitialized;
+    private static readonly IReadOnlyList<MediaAudioDeviceInfo> s_defaultInputDevices = MediaAudioDeviceCatalog.CreateDefaultInputDevices("libvlc");
+    private static readonly IReadOnlyList<MediaAudioDeviceInfo> s_defaultOutputDevices = MediaAudioDeviceCatalog.CreateDefaultOutputDevices("libvlc");
 
     private readonly LibVlcPlatformProfile _profile;
     private readonly LibVLC _libVlc;
@@ -23,6 +27,7 @@ internal sealed class LibVlcMediaBackend : IMediaBackend
     private readonly LibVlcMediaPlayer.LibVLCVideoDisplayCb _videoDisplayCallback;
     private readonly LibVlcMediaPlayer.LibVLCVideoFormatCb _videoFormatCallback;
     private readonly LibVlcMediaPlayer.LibVLCVideoCleanupCb _videoCleanupCallback;
+    private readonly object _audioRouteGate = new();
 
     private Media? _currentMedia;
     private IntPtr _frameBufferRaw;
@@ -33,7 +38,12 @@ internal sealed class LibVlcMediaBackend : IMediaBackend
     private uint _framePitch;
     private long _latestFrameSequence;
     private bool _looping;
+    private float _volume = 85f;
+    private bool _muted;
+    private double _playbackRate = 1d;
     private bool _disposed;
+    private string _selectedInputDeviceId = MediaAudioDeviceCatalog.PlatformDefaultInputDeviceId;
+    private string _selectedOutputDeviceId = MediaAudioDeviceCatalog.PlatformDefaultOutputDeviceId;
 
     public LibVlcMediaBackend()
     {
@@ -59,6 +69,8 @@ internal sealed class LibVlcMediaBackend : IMediaBackend
         _mediaPlayer.LengthChanged += OnTimelineChanged;
         _mediaPlayer.PositionChanged += OnTimelineChanged;
         _mediaPlayer.EncounteredError += OnEncounteredError;
+        _volume = Math.Clamp(_mediaPlayer.Volume, 0, 100);
+        _muted = _mediaPlayer.Mute;
     }
 
     public event EventHandler? FrameReady;
@@ -86,7 +98,73 @@ internal sealed class LibVlcMediaBackend : IMediaBackend
 
     public int VideoHeight => !_disposed ? (int)_frameHeight : 0;
 
+    public double FrameRate => !_disposed ? Math.Max(0d, _mediaPlayer.Fps) : 0d;
+
+    public double PlaybackRate => _playbackRate;
+
     public long LatestFrameSequence => Interlocked.Read(ref _latestFrameSequence);
+
+    public MediaAudioCapabilities AudioCapabilities =>
+        MediaAudioCapabilities.VolumeControl
+        | MediaAudioCapabilities.MuteControl
+        | MediaAudioCapabilities.AudioTrackEnumeration
+        | MediaAudioCapabilities.AudioTrackSelection
+        | MediaAudioCapabilities.InputDeviceEnumeration
+        | MediaAudioCapabilities.OutputDeviceEnumeration;
+
+    public bool SupportsVolumeControl => true;
+
+    public bool SupportsMuteControl => true;
+
+    public float Volume => _volume;
+
+    public bool IsMuted => _muted;
+
+    public IReadOnlyList<MediaAudioDeviceInfo> GetAudioInputDevices() => s_defaultInputDevices;
+
+    public IReadOnlyList<MediaAudioDeviceInfo> GetAudioOutputDevices() => s_defaultOutputDevices;
+
+    public MediaAudioRouteState GetAudioRouteState()
+    {
+        lock (_audioRouteGate)
+        {
+            return new(_selectedInputDeviceId, _selectedOutputDeviceId, LoopbackEnabled: false);
+        }
+    }
+
+    public bool TrySetAudioInputDevice(string deviceId)
+    {
+        ThrowIfDisposed();
+        var normalized = MediaAudioDeviceCatalog.NormalizeDeviceId(deviceId, MediaAudioDeviceCatalog.PlatformDefaultInputDeviceId);
+        if (!MediaAudioDeviceCatalog.TryGetCanonicalDeviceId(s_defaultInputDevices, normalized, out var canonical))
+        {
+            return false;
+        }
+
+        lock (_audioRouteGate)
+        {
+            _selectedInputDeviceId = canonical;
+        }
+
+        return true;
+    }
+
+    public bool TrySetAudioOutputDevice(string deviceId)
+    {
+        ThrowIfDisposed();
+        var normalized = MediaAudioDeviceCatalog.NormalizeDeviceId(deviceId, MediaAudioDeviceCatalog.PlatformDefaultOutputDeviceId);
+        if (!MediaAudioDeviceCatalog.TryGetCanonicalDeviceId(s_defaultOutputDevices, normalized, out var canonical))
+        {
+            return false;
+        }
+
+        lock (_audioRouteGate)
+        {
+            _selectedOutputDeviceId = canonical;
+        }
+
+        return true;
+    }
 
     public void Open(Uri source)
     {
@@ -111,6 +189,7 @@ internal sealed class LibVlcMediaBackend : IMediaBackend
         }
 
         _mediaPlayer.Play();
+        _mediaPlayer.SetRate((float)_playbackRate);
     }
 
     public void Pause()
@@ -150,18 +229,79 @@ internal sealed class LibVlcMediaBackend : IMediaBackend
     {
         ThrowIfDisposed();
         _mediaPlayer.Volume = (int)Math.Clamp(Math.Round(volume), 0, 100);
+        _volume = Math.Clamp(_mediaPlayer.Volume, 0, 100);
     }
 
     public void SetMuted(bool muted)
     {
         ThrowIfDisposed();
         _mediaPlayer.Mute = muted;
+        _muted = _mediaPlayer.Mute;
     }
 
     public void SetLooping(bool looping)
     {
         ThrowIfDisposed();
         _looping = looping;
+    }
+
+    public void SetPlaybackRate(double rate)
+    {
+        ThrowIfDisposed();
+        var clamped = Math.Clamp(rate, 0.1d, 16d);
+        var success = _mediaPlayer.SetRate((float)clamped) == 0;
+        if (success)
+        {
+            _playbackRate = clamped;
+        }
+        else
+        {
+            var current = (double)_mediaPlayer.Rate;
+            if (current > 0d)
+            {
+                _playbackRate = current;
+            }
+        }
+
+        TimelineChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    public IReadOnlyList<MediaTrackInfo> GetAudioTracks()
+    {
+        ThrowIfDisposed();
+        return BuildTrackInfos(_mediaPlayer.AudioTrackDescription, _mediaPlayer.AudioTrack, includeOffOption: false);
+    }
+
+    public IReadOnlyList<MediaTrackInfo> GetSubtitleTracks()
+    {
+        ThrowIfDisposed();
+        return BuildTrackInfos(_mediaPlayer.SpuDescription, _mediaPlayer.Spu, includeOffOption: true);
+    }
+
+    public bool SetAudioTrack(int trackId)
+    {
+        ThrowIfDisposed();
+        var success = _mediaPlayer.SetAudioTrack(trackId);
+        if (success)
+        {
+            TimelineChanged?.Invoke(this, EventArgs.Empty);
+            PlaybackStateChanged?.Invoke(this, EventArgs.Empty);
+        }
+
+        return success;
+    }
+
+    public bool SetSubtitleTrack(int trackId)
+    {
+        ThrowIfDisposed();
+        var success = _mediaPlayer.SetSpu(trackId);
+        if (success)
+        {
+            TimelineChanged?.Invoke(this, EventArgs.Empty);
+            PlaybackStateChanged?.Invoke(this, EventArgs.Empty);
+        }
+
+        return success;
     }
 
     public bool TryAcquireFrame(out MediaFrameLease frame)
@@ -374,6 +514,33 @@ internal sealed class LibVlcMediaBackend : IMediaBackend
         return File.Exists(Path.Combine(directory, "libvlc.so"))
                || File.Exists(Path.Combine(directory, "libvlc.so.5"))
                || File.Exists(Path.Combine(directory, "libvlc.so.9"));
+    }
+
+    private static IReadOnlyList<MediaTrackInfo> BuildTrackInfos(
+        IEnumerable<TrackDescription>? descriptions,
+        int selectedTrackId,
+        bool includeOffOption)
+    {
+        var tracks = new List<MediaTrackInfo>();
+        if (includeOffOption)
+        {
+            tracks.Add(new MediaTrackInfo(-1, "Off", selectedTrackId < 0));
+        }
+
+        if (descriptions is null)
+        {
+            return tracks;
+        }
+
+        foreach (var description in descriptions)
+        {
+            var name = string.IsNullOrWhiteSpace(description.Name)
+                ? $"Track {description.Id}"
+                : description.Name;
+            tracks.Add(new MediaTrackInfo(description.Id, name, description.Id == selectedTrackId));
+        }
+
+        return tracks;
     }
 
     private static void WriteFourCc(IntPtr chroma, string fourCc)

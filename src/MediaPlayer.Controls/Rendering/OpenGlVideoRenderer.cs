@@ -31,6 +31,7 @@ internal sealed class OpenGlVideoRenderer
     private int _quadVideoHeight;
     private readonly float[] _quadVertices = new float[24];
     private bool _quadDirty = true;
+    private VideoLayoutMode _layoutMode = VideoLayoutMode.Fit;
     private byte[]? _strideCopyBuffer;
     private bool _initialized;
     private GlVersion _glVersion;
@@ -191,7 +192,7 @@ internal sealed class OpenGlVideoRenderer
             || _quadVideoWidth != _videoWidth
             || _quadVideoHeight != _videoHeight)
         {
-            UpdateAspectFittedQuad(width, height, _videoWidth, _videoHeight);
+            UpdateQuadForLayoutMode(width, height, _videoWidth, _videoHeight, _layoutMode);
             _quadDirty = true;
         }
 
@@ -311,6 +312,17 @@ internal sealed class OpenGlVideoRenderer
         _quadDirty = true;
     }
 
+    public void SetLayoutMode(VideoLayoutMode mode)
+    {
+        if (_layoutMode == mode)
+        {
+            return;
+        }
+
+        _layoutMode = mode;
+        _quadDirty = true;
+    }
+
     private static T? TryLoadDelegate<T>(GlInterface gl, string proc) where T : class
     {
         var address = gl.GetProcAddress(proc);
@@ -374,7 +386,12 @@ internal sealed class OpenGlVideoRenderer
             data: data);
     }
 
-    private void UpdateAspectFittedQuad(int viewportWidth, int viewportHeight, int videoWidth, int videoHeight)
+    private void UpdateQuadForLayoutMode(
+        int viewportWidth,
+        int viewportHeight,
+        int videoWidth,
+        int videoHeight,
+        VideoLayoutMode mode)
     {
         if (viewportWidth <= 0 || viewportHeight <= 0 || videoWidth <= 0 || videoHeight <= 0)
         {
@@ -391,14 +408,31 @@ internal sealed class OpenGlVideoRenderer
 
         var scaleX = 1f;
         var scaleY = 1f;
+        var fillScaleX = 1f;
+        var fillScaleY = 1f;
 
         if (videoAspect > viewportAspect)
         {
             scaleY = viewportAspect / videoAspect;
+            fillScaleX = videoAspect / viewportAspect;
         }
         else
         {
             scaleX = videoAspect / viewportAspect;
+            fillScaleY = viewportAspect / videoAspect;
+        }
+
+        if (mode == VideoLayoutMode.Fill)
+        {
+            scaleX = fillScaleX;
+            scaleY = fillScaleY;
+        }
+        else if (mode == VideoLayoutMode.Panoramic)
+        {
+            // Panoramic blends fit and fill for a subtle center-focused crop similar to movie player panoramic view.
+            const float panoramicBlend = 0.42f;
+            scaleX += (fillScaleX - scaleX) * panoramicBlend;
+            scaleY += (fillScaleY - scaleY) * panoramicBlend;
         }
 
         _quadVertices[0] = -scaleX; _quadVertices[1] = -scaleY; _quadVertices[2] = 0f; _quadVertices[3] = 1f;

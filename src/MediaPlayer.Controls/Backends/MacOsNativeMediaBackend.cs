@@ -81,7 +81,12 @@ internal sealed class MacOsNativeMediaBackend : NativeFramePumpMediaBackend
         return psi;
     }
 
-    protected override ProcessStartInfo CreatePlaybackProcess(Uri source, TimeSpan startPosition)
+    protected override ProcessStartInfo CreatePlaybackProcess(
+        Uri source,
+        TimeSpan startPosition,
+        double playbackRate,
+        float volume,
+        bool muted)
     {
         var psi = CreateToolProcess(s_helperPath!);
         psi.ArgumentList.Add("play");
@@ -89,6 +94,12 @@ internal sealed class MacOsNativeMediaBackend : NativeFramePumpMediaBackend
         psi.ArgumentList.Add(ResolveMediaSource(source));
         psi.ArgumentList.Add("--start");
         psi.ArgumentList.Add(FormatSeconds(startPosition));
+        psi.ArgumentList.Add("--speed");
+        psi.ArgumentList.Add(playbackRate.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture));
+        psi.ArgumentList.Add("--volume");
+        psi.ArgumentList.Add(Math.Clamp(volume, 0f, 100f).ToString("0.###", System.Globalization.CultureInfo.InvariantCulture));
+        psi.ArgumentList.Add("--mute");
+        psi.ArgumentList.Add(muted ? "1" : "0");
         return psi;
     }
 
@@ -234,6 +245,7 @@ struct ProbeInfo: Codable {
     let width: Int
     let height: Int
     let duration: Double
+    let frameRate: Double
 }
 
 enum HelperError: Error {
@@ -294,7 +306,8 @@ func probe(source: String) throws {
     let track = try loadVideoTrack(asset)
     let (width, height) = transformedSize(for: track)
     let durationSeconds = max(0.0, CMTimeGetSeconds(asset.duration))
-    let payload = ProbeInfo(width: width, height: height, duration: durationSeconds)
+    let fps = max(0.0, Double(track.nominalFrameRate))
+    let payload = ProbeInfo(width: width, height: height, duration: durationSeconds, frameRate: fps)
     let data = try JSONEncoder().encode(payload)
     FileHandle.standardOutput.write(data)
 }
@@ -370,7 +383,61 @@ func writeSample(_ sample: CMSampleBuffer, width: Int, height: Int, reusableBuff
     FileHandle.standardOutput.write(reusableBuffer)
 }
 
-func streamFrames(source: String, startSeconds: Double, singleFrameOnly: Bool) throws {
+func parseBool(_ value: String?) -> Bool {
+    guard let value else { return false }
+    switch value.lowercased() {
+    case "1", "true", "yes", "y":
+        return true
+    default:
+        return false
+    }
+}
+
+func pumpRunLoopSlice(_ interval: TimeInterval) {
+    let bounded = max(0.0005, min(interval, 0.05))
+    let deadline = Date(timeIntervalSinceNow: bounded)
+    _ = RunLoop.current.run(mode: .default, before: deadline)
+}
+
+func waitForPlayerReady(_ player: AVPlayer, timeoutSeconds: Double) throws {
+    guard let item = player.currentItem else {
+        throw HelperError.mediaOpen("AVPlayer item is unavailable.")
+    }
+
+    let timeout = Date(timeIntervalSinceNow: max(0.5, timeoutSeconds))
+    while item.status == .unknown {
+        if Date() >= timeout {
+            throw HelperError.mediaOpen("Timed out waiting for AVPlayer item readiness.")
+        }
+
+        pumpRunLoopSlice(0.01)
+    }
+
+    if item.status == .failed {
+        let reason = item.error?.localizedDescription ?? "AVPlayer item failed to load."
+        throw HelperError.mediaOpen(reason)
+    }
+}
+
+func createAudioPlayer(source: String, startSeconds: Double, volume: Double, muted: Bool) -> AVPlayer {
+    let item = AVPlayerItem(url: mediaURL(from: source))
+    let player = AVPlayer(playerItem: item)
+    player.isMuted = muted
+    player.volume = Float(max(0.0, min(1.0, volume / 100.0)))
+
+    let start = CMTime(seconds: max(0.0, startSeconds), preferredTimescale: 600)
+    if CMTimeCompare(start, .zero) > 0 {
+        let semaphore = DispatchSemaphore(value: 0)
+        player.seek(to: start, toleranceBefore: .zero, toleranceAfter: .zero) { _ in
+            semaphore.signal()
+        }
+        _ = semaphore.wait(timeout: DispatchTime.now() + .seconds(2))
+    }
+
+    return player
+}
+
+func streamFrames(source: String, startSeconds: Double, singleFrameOnly: Bool, speed: Double, volume: Double, muted: Bool) throws {
     let url = mediaURL(from: source)
     let asset = AVURLAsset(url: url)
     let track = try loadVideoTrack(asset)
@@ -379,19 +446,81 @@ func streamFrames(source: String, startSeconds: Double, singleFrameOnly: Bool) t
 
     var reusable = Data()
     var firstPts: Double?
+    var firstAudioTime: Double?
     let wallStart = CACurrentMediaTime()
+    var audioPlayer: AVPlayer?
+    var useAudioClock = false
+    var didWarnAudioClockFallback = false
+
+    if !singleFrameOnly {
+        let player = createAudioPlayer(source: source, startSeconds: startSeconds, volume: volume, muted: muted)
+        try waitForPlayerReady(player, timeoutSeconds: 5.0)
+        audioPlayer = player
+        player.playImmediately(atRate: Float(max(0.1, speed)))
+        useAudioClock = true
+    }
 
     while let sample = output.copyNextSampleBuffer() {
         let pts = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sample))
         if !singleFrameOnly {
-            if let first = firstPts {
-                let target = pts - first
+            if firstPts == nil {
+                firstPts = pts
+                if let player = audioPlayer {
+                    firstAudioTime = CMTimeGetSeconds(player.currentTime())
+                }
+            }
+
+            if useAudioClock, let player = audioPlayer {
+                guard let basePts = firstPts else {
+                    throw HelperError.streamUnavailable("Unable to initialize audio/video sync.")
+                }
+
+                let targetRelative = max(0.0, pts - basePts)
+                let baseAudioTime = firstAudioTime ?? CMTimeGetSeconds(player.currentTime())
+                var previousAudioRelative = -1.0
+                var stagnationCount = 0
+
+                while true {
+                    if let item = player.currentItem, item.status == .failed {
+                        let reason = item.error?.localizedDescription ?? "AVPlayer audio output failed."
+                        throw HelperError.streamUnavailable(reason)
+                    }
+
+                    let currentAudioTime = CMTimeGetSeconds(player.currentTime())
+                    let audioRelative = max(0.0, currentAudioTime - baseAudioTime)
+                    if audioRelative + 0.012 >= targetRelative {
+                        break
+                    }
+
+                    if abs(audioRelative - previousAudioRelative) < 0.0005 {
+                        stagnationCount += 1
+                    } else {
+                        stagnationCount = 0
+                    }
+
+                    if stagnationCount >= 32 {
+                        useAudioClock = false
+                        if !didWarnAudioClockFallback {
+                            didWarnAudioClockFallback = true
+                            if let warningData = "Audio clock stalled. Falling back to wall-clock sync.\n".data(using: .utf8) {
+                                FileHandle.standardError.write(warningData)
+                            }
+                        }
+                        break
+                    }
+
+                    previousAudioRelative = audioRelative
+                    let remaining = targetRelative - audioRelative
+                    pumpRunLoopSlice(min(0.008, max(0.001, remaining)))
+                }
+            }
+
+            if !useAudioClock, let first = firstPts {
+                let target = (pts - first) / max(0.1, speed)
                 let elapsed = CACurrentMediaTime() - wallStart
                 if target > elapsed {
                     Thread.sleep(forTimeInterval: target - elapsed)
                 }
-            } else {
-                firstPts = pts
             }
         }
 
@@ -399,7 +528,12 @@ func streamFrames(source: String, startSeconds: Double, singleFrameOnly: Bool) t
         if singleFrameOnly {
             break
         }
+
+        pumpRunLoopSlice(0.0015)
     }
+
+    audioPlayer?.pause()
+    audioPlayer = nil
 }
 
 func run() throws {
@@ -419,10 +553,19 @@ func run() throws {
         try probe(source: source)
     case "play":
         let start = Double(value(for: "--start", args: args) ?? "0") ?? 0
-        try streamFrames(source: source, startSeconds: max(0, start), singleFrameOnly: false)
+        let speed = Double(value(for: "--speed", args: args) ?? "1") ?? 1
+        let volume = Double(value(for: "--volume", args: args) ?? "100") ?? 100
+        let muted = parseBool(value(for: "--mute", args: args))
+        try streamFrames(
+            source: source,
+            startSeconds: max(0, start),
+            singleFrameOnly: false,
+            speed: max(0.1, speed),
+            volume: max(0, min(100, volume)),
+            muted: muted)
     case "frame":
         let at = Double(value(for: "--time", args: args) ?? "0") ?? 0
-        try streamFrames(source: source, startSeconds: max(0, at), singleFrameOnly: true)
+        try streamFrames(source: source, startSeconds: max(0, at), singleFrameOnly: true, speed: 1, volume: 100, muted: false)
     default:
         throw HelperError.invalidArgs("Unknown command: \(command)")
     }

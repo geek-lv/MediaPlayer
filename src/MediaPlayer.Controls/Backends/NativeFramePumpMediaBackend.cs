@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
@@ -6,11 +7,24 @@ using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using MediaPlayer.Controls.Audio;
 
 namespace MediaPlayer.Controls.Backends;
 
-internal abstract class NativeFramePumpMediaBackend : IMediaBackend
+internal abstract class NativeFramePumpMediaBackend : IMediaBackend, IMediaAudioCapabilityProvider, IMediaAudioPlaybackController, IMediaAudioDeviceController
 {
+    private static readonly IReadOnlyList<MediaTrackInfo> s_emptyTracks = Array.Empty<MediaTrackInfo>();
+    private static readonly IReadOnlyList<MediaAudioDeviceInfo> s_defaultInputDevices = MediaAudioDeviceCatalog.CreateDefaultInputDevices("native-helper");
+    private static readonly IReadOnlyList<MediaAudioDeviceInfo> s_defaultOutputDevices = MediaAudioDeviceCatalog.CreateDefaultOutputDevices("native-helper");
+    private const int DefaultAudioTrackId = 0;
+    private static readonly IReadOnlyList<MediaTrackInfo> s_defaultAudioTrackSelected =
+    [
+        new MediaTrackInfo(DefaultAudioTrackId, "Default", true)
+    ];
+    private static readonly IReadOnlyList<MediaTrackInfo> s_defaultAudioTrackUnselected =
+    [
+        new MediaTrackInfo(DefaultAudioTrackId, "Default", false)
+    ];
     private readonly object _frameGate = new();
     private readonly object _stateGate = new();
     private readonly object _processGate = new();
@@ -26,13 +40,20 @@ internal abstract class NativeFramePumpMediaBackend : IMediaBackend
     private int _frameStride;
     private bool _disposed;
     private bool _looping;
+    private float _volume = 85f;
+    private bool _muted;
+    private int _selectedAudioTrackId = DefaultAudioTrackId;
     private Uri? _source;
     private TimeSpan _duration;
     private TimeSpan _position;
     private TimeSpan _positionAtPlayStart;
-    private DateTime _playbackStartedUtc;
+    private long _playbackStartedTimestamp;
     private bool _isPlaying;
     private long _latestFrameSequence;
+    private double _frameRate;
+    private double _playbackRate = 1d;
+    private string _selectedInputDeviceId = MediaAudioDeviceCatalog.PlatformDefaultInputDeviceId;
+    private string _selectedOutputDeviceId = MediaAudioDeviceCatalog.PlatformDefaultOutputDeviceId;
 
     protected NativeFramePumpMediaBackend()
     {
@@ -75,8 +96,8 @@ internal abstract class NativeFramePumpMediaBackend : IMediaBackend
                     return _position;
                 }
 
-                var elapsed = DateTime.UtcNow - _playbackStartedUtc;
-                var current = _positionAtPlayStart + elapsed;
+                var elapsedSeconds = GetElapsedSeconds(_playbackStartedTimestamp);
+                var current = _positionAtPlayStart + TimeSpan.FromSeconds(elapsedSeconds * _playbackRate);
                 if (_duration > TimeSpan.Zero && current > _duration)
                 {
                     current = _duration;
@@ -102,11 +123,114 @@ internal abstract class NativeFramePumpMediaBackend : IMediaBackend
 
     public int VideoHeight => _frameHeight;
 
+    public double FrameRate
+    {
+        get
+        {
+            lock (_stateGate)
+            {
+                return _frameRate;
+            }
+        }
+    }
+
+    public double PlaybackRate
+    {
+        get
+        {
+            lock (_stateGate)
+            {
+                return _playbackRate;
+            }
+        }
+    }
+
     public long LatestFrameSequence => Interlocked.Read(ref _latestFrameSequence);
+
+    public MediaAudioCapabilities AudioCapabilities =>
+        MediaAudioCapabilities.VolumeControl
+        | MediaAudioCapabilities.MuteControl
+        | MediaAudioCapabilities.AudioTrackEnumeration
+        | MediaAudioCapabilities.AudioTrackSelection
+        | MediaAudioCapabilities.InputDeviceEnumeration
+        | MediaAudioCapabilities.OutputDeviceEnumeration;
+
+    public bool SupportsVolumeControl => true;
+
+    public bool SupportsMuteControl => true;
+
+    public float Volume
+    {
+        get
+        {
+            lock (_stateGate)
+            {
+                return _volume;
+            }
+        }
+    }
+
+    public bool IsMuted
+    {
+        get
+        {
+            lock (_stateGate)
+            {
+                return _muted;
+            }
+        }
+    }
+
+    public IReadOnlyList<MediaAudioDeviceInfo> GetAudioInputDevices() => s_defaultInputDevices;
+
+    public IReadOnlyList<MediaAudioDeviceInfo> GetAudioOutputDevices() => s_defaultOutputDevices;
+
+    public MediaAudioRouteState GetAudioRouteState()
+    {
+        lock (_stateGate)
+        {
+            return new MediaAudioRouteState(_selectedInputDeviceId, _selectedOutputDeviceId, LoopbackEnabled: false);
+        }
+    }
+
+    public bool TrySetAudioInputDevice(string deviceId)
+    {
+        ThrowIfDisposed();
+        var normalized = MediaAudioDeviceCatalog.NormalizeDeviceId(deviceId, MediaAudioDeviceCatalog.PlatformDefaultInputDeviceId);
+        if (!MediaAudioDeviceCatalog.TryGetCanonicalDeviceId(s_defaultInputDevices, normalized, out var canonical))
+        {
+            return false;
+        }
+
+        lock (_stateGate)
+        {
+            _selectedInputDeviceId = canonical;
+        }
+
+        return true;
+    }
+
+    public bool TrySetAudioOutputDevice(string deviceId)
+    {
+        ThrowIfDisposed();
+        var normalized = MediaAudioDeviceCatalog.NormalizeDeviceId(deviceId, MediaAudioDeviceCatalog.PlatformDefaultOutputDeviceId);
+        if (!MediaAudioDeviceCatalog.TryGetCanonicalDeviceId(s_defaultOutputDevices, normalized, out var canonical))
+        {
+            return false;
+        }
+
+        lock (_stateGate)
+        {
+            _selectedOutputDeviceId = canonical;
+        }
+
+        return true;
+    }
 
     public void Open(Uri source)
     {
         ThrowIfDisposed();
+        CancelPreviewFrameRequest();
         StopPlaybackProcess(resetPosition: false);
         ReleaseFrameBuffer();
 
@@ -115,7 +239,7 @@ internal abstract class NativeFramePumpMediaBackend : IMediaBackend
             throw new InvalidOperationException(helperError);
         }
 
-        if (!TryProbeSource(source, out var width, out var height, out var duration, out var probeError))
+        if (!TryProbeSource(source, out var width, out var height, out var duration, out var frameRate, out var probeError))
         {
             throw new InvalidOperationException(probeError);
         }
@@ -126,8 +250,10 @@ internal abstract class NativeFramePumpMediaBackend : IMediaBackend
             _duration = duration;
             _position = TimeSpan.Zero;
             _positionAtPlayStart = TimeSpan.Zero;
-            _playbackStartedUtc = DateTime.UtcNow;
+            _playbackStartedTimestamp = Stopwatch.GetTimestamp();
             _isPlaying = false;
+            _frameRate = frameRate;
+            _selectedAudioTrackId = DefaultAudioTrackId;
         }
 
         _frameWidth = width;
@@ -161,12 +287,20 @@ internal abstract class NativeFramePumpMediaBackend : IMediaBackend
 
             startPosition = _position;
             _positionAtPlayStart = _position;
-            _playbackStartedUtc = DateTime.UtcNow;
+            _playbackStartedTimestamp = Stopwatch.GetTimestamp();
             _isPlaying = true;
         }
 
         CancelPreviewFrameRequest();
-        StartPlaybackProcess(source, startPosition);
+        if (!TryStartPlaybackProcess(
+                source,
+                startPosition,
+                "Unable to start native playback process.",
+                markNotPlayingOnFailure: true))
+        {
+            return;
+        }
+
         PlaybackStateChanged?.Invoke(this, EventArgs.Empty);
     }
 
@@ -233,14 +367,21 @@ internal abstract class NativeFramePumpMediaBackend : IMediaBackend
 
             _position = clamped;
             _positionAtPlayStart = clamped;
-            _playbackStartedUtc = DateTime.UtcNow;
+            _playbackStartedTimestamp = Stopwatch.GetTimestamp();
             shouldRestartPlayback = _isPlaying;
             position = clamped;
         }
 
         if (shouldRestartPlayback)
         {
-            StartPlaybackProcess(source, position);
+            if (!TryStartPlaybackProcess(
+                    source,
+                    position,
+                    "Seek restart failed.",
+                    markNotPlayingOnFailure: true))
+            {
+                return;
+            }
         }
         else
         {
@@ -252,12 +393,89 @@ internal abstract class NativeFramePumpMediaBackend : IMediaBackend
 
     public void SetVolume(float volume)
     {
-        // Native helper backends currently do not expose volume control.
+        ThrowIfDisposed();
+        var clamped = Math.Clamp(volume, 0f, 100f);
+        bool changed;
+        Uri? source;
+        bool wasPlaying;
+        TimeSpan restartPosition;
+        lock (_stateGate)
+        {
+            changed = Math.Abs(_volume - clamped) > 0.01f;
+            _volume = clamped;
+            if (!changed)
+            {
+                return;
+            }
+
+            source = _source;
+            wasPlaying = _isPlaying;
+            restartPosition = _isPlaying ? Position : _position;
+            _position = restartPosition;
+            _positionAtPlayStart = restartPosition;
+            _playbackStartedTimestamp = Stopwatch.GetTimestamp();
+        }
+
+        if (source is null)
+        {
+            return;
+        }
+
+        if (wasPlaying
+            && !TryStartPlaybackProcess(
+                source,
+                restartPosition,
+                "Volume update restart failed.",
+                markNotPlayingOnFailure: true))
+        {
+            return;
+        }
+
+        TimelineChanged?.Invoke(this, EventArgs.Empty);
+        PlaybackStateChanged?.Invoke(this, EventArgs.Empty);
     }
 
     public void SetMuted(bool muted)
     {
-        // Native helper backends currently do not expose mute control.
+        ThrowIfDisposed();
+        bool changed;
+        Uri? source;
+        bool wasPlaying;
+        TimeSpan restartPosition;
+        lock (_stateGate)
+        {
+            changed = _muted != muted;
+            _muted = muted;
+            if (!changed)
+            {
+                return;
+            }
+
+            source = _source;
+            wasPlaying = _isPlaying;
+            restartPosition = _isPlaying ? Position : _position;
+            _position = restartPosition;
+            _positionAtPlayStart = restartPosition;
+            _playbackStartedTimestamp = Stopwatch.GetTimestamp();
+        }
+
+        if (source is null)
+        {
+            return;
+        }
+
+        if (wasPlaying
+            && !TryStartPlaybackProcess(
+                source,
+                restartPosition,
+                "Mute update restart failed.",
+                markNotPlayingOnFailure: true))
+        {
+            return;
+        }
+
+        TimelineChanged?.Invoke(this, EventArgs.Empty);
+        PlaybackStateChanged?.Invoke(this, EventArgs.Empty);
     }
 
     public void SetLooping(bool looping)
@@ -265,16 +483,140 @@ internal abstract class NativeFramePumpMediaBackend : IMediaBackend
         _looping = looping;
     }
 
+    public void SetPlaybackRate(double rate)
+    {
+        ThrowIfDisposed();
+        var clamped = Math.Clamp(rate, 0.1d, 16d);
+        Uri? source;
+        TimeSpan restartPosition;
+        bool wasPlaying;
+
+        lock (_stateGate)
+        {
+            _playbackRate = clamped;
+            source = _source;
+            wasPlaying = _isPlaying;
+            restartPosition = _isPlaying ? Position : _position;
+            _position = restartPosition;
+            _positionAtPlayStart = restartPosition;
+            _playbackStartedTimestamp = Stopwatch.GetTimestamp();
+        }
+
+        if (source is null)
+        {
+            return;
+        }
+
+        if (wasPlaying)
+        {
+            if (!TryStartPlaybackProcess(
+                    source,
+                    restartPosition,
+                    "Playback-rate restart failed.",
+                    markNotPlayingOnFailure: true))
+            {
+                return;
+            }
+        }
+        else
+        {
+            RequestPreviewFrame(source, restartPosition);
+        }
+
+        TimelineChanged?.Invoke(this, EventArgs.Empty);
+        PlaybackStateChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    public IReadOnlyList<MediaTrackInfo> GetAudioTracks()
+    {
+        lock (_stateGate)
+        {
+            if (_source is null)
+            {
+                return s_emptyTracks;
+            }
+
+            return _selectedAudioTrackId == DefaultAudioTrackId
+                ? s_defaultAudioTrackSelected
+                : s_defaultAudioTrackUnselected;
+        }
+    }
+
+    public IReadOnlyList<MediaTrackInfo> GetSubtitleTracks() => s_emptyTracks;
+
+    public bool SetAudioTrack(int trackId)
+    {
+        ThrowIfDisposed();
+        if (trackId != DefaultAudioTrackId)
+        {
+            return false;
+        }
+
+        Uri? source;
+        bool changed;
+        bool wasPlaying;
+        TimeSpan restartPosition;
+        lock (_stateGate)
+        {
+            source = _source;
+            if (source is null)
+            {
+                return false;
+            }
+
+            changed = _selectedAudioTrackId != trackId;
+            _selectedAudioTrackId = trackId;
+            wasPlaying = _isPlaying;
+            restartPosition = _isPlaying ? Position : _position;
+            _position = restartPosition;
+            _positionAtPlayStart = restartPosition;
+            _playbackStartedTimestamp = Stopwatch.GetTimestamp();
+        }
+
+        if (!changed)
+        {
+            return true;
+        }
+
+        if (wasPlaying)
+        {
+            if (!TryStartPlaybackProcess(
+                    source,
+                    restartPosition,
+                    "Audio track update restart failed.",
+                    markNotPlayingOnFailure: true))
+            {
+                return false;
+            }
+        }
+        else
+        {
+            RequestPreviewFrame(source, restartPosition);
+        }
+
+        TimelineChanged?.Invoke(this, EventArgs.Empty);
+        PlaybackStateChanged?.Invoke(this, EventArgs.Empty);
+        return true;
+    }
+
+    public bool SetSubtitleTrack(int trackId) => false;
+
     public bool TryAcquireFrame(out MediaFrameLease frame)
     {
         frame = default;
 
-        if (_disposed || !_pinnedFrameBuffer.IsAllocated || _frameBuffer is null)
+        if (_disposed)
         {
             return false;
         }
 
         Monitor.Enter(_frameGate);
+        if (_disposed || !_pinnedFrameBuffer.IsAllocated || _frameBuffer is null || _frameWidth <= 0 || _frameHeight <= 0 || _frameStride <= 0)
+        {
+            Monitor.Exit(_frameGate);
+            return false;
+        }
+
         frame = new MediaFrameLease(
             _frameGate,
             _pinnedFrameBuffer.AddrOfPinnedObject(),
@@ -309,17 +651,23 @@ internal abstract class NativeFramePumpMediaBackend : IMediaBackend
 
     protected abstract ProcessStartInfo CreateProbeProcess(Uri source);
 
-    protected abstract ProcessStartInfo CreatePlaybackProcess(Uri source, TimeSpan startPosition);
+    protected abstract ProcessStartInfo CreatePlaybackProcess(
+        Uri source,
+        TimeSpan startPosition,
+        double playbackRate,
+        float volume,
+        bool muted);
 
     protected abstract ProcessStartInfo CreateSingleFrameProcess(Uri source, TimeSpan position);
 
     protected virtual TimeSpan PlaybackReadJoinTimeout => TimeSpan.FromMilliseconds(35);
 
-    private bool TryProbeSource(Uri source, out int width, out int height, out TimeSpan duration, out string error)
+    private bool TryProbeSource(Uri source, out int width, out int height, out TimeSpan duration, out double frameRate, out string error)
     {
         width = 0;
         height = 0;
         duration = TimeSpan.Zero;
+        frameRate = 0d;
         error = string.Empty;
 
         try
@@ -333,7 +681,24 @@ internal abstract class NativeFramePumpMediaBackend : IMediaBackend
 
             var stdoutTask = process.StandardOutput.ReadToEndAsync();
             var stderrTask = process.StandardError.ReadToEndAsync();
-            process.WaitForExit(15000);
+            if (!process.WaitForExit(15000))
+            {
+                try
+                {
+                    if (!process.HasExited)
+                    {
+                        process.Kill(entireProcessTree: true);
+                        process.WaitForExit(200);
+                    }
+                }
+                catch
+                {
+                    // Best effort timeout cleanup.
+                }
+
+                error = "Native probe helper timed out.";
+                return false;
+            }
 
             var stdout = stdoutTask.GetAwaiter().GetResult();
             var stderr = stderrTask.GetAwaiter().GetResult();
@@ -354,6 +719,10 @@ internal abstract class NativeFramePumpMediaBackend : IMediaBackend
                 ? durationProp.GetDouble()
                 : 0d;
             duration = durationSeconds > 0d ? TimeSpan.FromSeconds(durationSeconds) : TimeSpan.Zero;
+            frameRate = root.TryGetProperty("frameRate", out var frameRateProp)
+                        && frameRateProp.ValueKind is JsonValueKind.Number
+                ? Math.Max(0d, frameRateProp.GetDouble())
+                : 0d;
 
             if (width <= 0 || height <= 0)
             {
@@ -372,9 +741,20 @@ internal abstract class NativeFramePumpMediaBackend : IMediaBackend
 
     private void StartPlaybackProcess(Uri source, TimeSpan startPosition)
     {
+        CancelPreviewFrameRequest();
         StopPlaybackProcess(resetPosition: false);
 
-        var process = Process.Start(CreatePlaybackProcess(source, startPosition))
+        double playbackRate;
+        float volume;
+        bool muted;
+        lock (_stateGate)
+        {
+            playbackRate = _playbackRate;
+            volume = _volume;
+            muted = _muted;
+        }
+
+        var process = Process.Start(CreatePlaybackProcess(source, startPosition, playbackRate, volume, muted))
             ?? throw new InvalidOperationException("Unable to start native playback helper.");
         var cts = new CancellationTokenSource();
 
@@ -400,6 +780,38 @@ internal abstract class NativeFramePumpMediaBackend : IMediaBackend
                 // Ignore stderr races during teardown.
             }
         });
+    }
+
+    private bool TryStartPlaybackProcess(
+        Uri source,
+        TimeSpan startPosition,
+        string failurePrefix,
+        bool markNotPlayingOnFailure)
+    {
+        try
+        {
+            StartPlaybackProcess(source, startPosition);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            lock (_stateGate)
+            {
+                if (markNotPlayingOnFailure)
+                {
+                    _isPlaying = false;
+                }
+
+                _position = startPosition;
+                _positionAtPlayStart = startPosition;
+                _playbackStartedTimestamp = Stopwatch.GetTimestamp();
+            }
+
+            ErrorOccurred?.Invoke(this, $"{failurePrefix} {ex.Message}");
+            PlaybackStateChanged?.Invoke(this, EventArgs.Empty);
+            TimelineChanged?.Invoke(this, EventArgs.Empty);
+            return false;
+        }
     }
 
     private async Task ReadFramesLoopAsync(Process process, CancellationToken cancellationToken)
@@ -445,11 +857,19 @@ internal abstract class NativeFramePumpMediaBackend : IMediaBackend
             {
                 _position = TimeSpan.Zero;
                 _positionAtPlayStart = TimeSpan.Zero;
-                _playbackStartedUtc = DateTime.UtcNow;
+                _playbackStartedTimestamp = Stopwatch.GetTimestamp();
                 _isPlaying = true;
             }
 
-            StartPlaybackProcess(_source, TimeSpan.Zero);
+            if (!TryStartPlaybackProcess(
+                    _source,
+                    TimeSpan.Zero,
+                    "Loop restart failed.",
+                    markNotPlayingOnFailure: true))
+            {
+                return;
+            }
+
             return;
         }
 
@@ -521,6 +941,7 @@ internal abstract class NativeFramePumpMediaBackend : IMediaBackend
         }
 
         previous?.Cancel();
+        previous?.Dispose();
         _ = Task.Run(() => DecodePreviewFrame(source, position, cts.Token), cts.Token);
     }
 
@@ -629,6 +1050,22 @@ internal abstract class NativeFramePumpMediaBackend : IMediaBackend
         }
 
         return total;
+    }
+
+    private static double GetElapsedSeconds(long startedTimestamp)
+    {
+        if (startedTimestamp <= 0)
+        {
+            return 0d;
+        }
+
+        var elapsedTicks = Stopwatch.GetTimestamp() - startedTimestamp;
+        if (elapsedTicks <= 0)
+        {
+            return 0d;
+        }
+
+        return elapsedTicks / (double)Stopwatch.Frequency;
     }
 
     protected static ProcessStartInfo CreateToolProcess(string fileName)
