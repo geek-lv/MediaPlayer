@@ -17,6 +17,12 @@ internal enum MenuTimeDisplayMode
     FrameCount
 }
 
+internal enum MenuTextureUploadMode
+{
+    DirectGpu,
+    CompatibilityCopy
+}
+
 internal readonly record struct MainWindowNativeMenuState(
     bool IsPlaying,
     bool IsMuted,
@@ -27,6 +33,7 @@ internal readonly record struct MainWindowNativeMenuState(
     MenuTimeDisplayMode TimeDisplayMode,
     VideoLayoutMode LayoutMode,
     double PlaybackRate,
+    MenuTextureUploadMode TextureUploadMode,
     RendererPreference RendererPreference,
     MediaWorkflowQualityProfile WorkflowQualityProfile);
 
@@ -82,6 +89,8 @@ internal sealed class MainWindowNativeMenuActions
     public required EventHandler OnRendererVulkanClicked { get; init; }
     public required EventHandler OnRendererMetalClicked { get; init; }
     public required EventHandler OnRendererSoftwareClicked { get; init; }
+    public required EventHandler OnTextureUploadDirectClicked { get; init; }
+    public required EventHandler OnTextureUploadCompatibilityClicked { get; init; }
     public required EventHandler OnToggleFullScreenClicked { get; init; }
     public required EventHandler OnShowMovieInspectorClicked { get; init; }
     public required EventHandler OnMinimizeClicked { get; init; }
@@ -117,6 +126,8 @@ internal sealed class MainWindowNativeMenuCoordinator
     private NativeMenuItem? _menuRendererVulkanItem;
     private NativeMenuItem? _menuRendererMetalItem;
     private NativeMenuItem? _menuRendererSoftwareItem;
+    private NativeMenuItem? _menuTextureUploadDirectItem;
+    private NativeMenuItem? _menuTextureUploadCompatibilityItem;
     private NativeMenuItem? _menuFloatOnTopItem;
     private NativeMenuItem? _menuTimeRemainingItem;
     private NativeMenuItem? _menuTimeElapsedItem;
@@ -299,6 +310,16 @@ internal sealed class MainWindowNativeMenuCoordinator
         if (_menuRendererSoftwareItem is not null)
         {
             _menuRendererSoftwareItem.IsChecked = state.RendererPreference == RendererPreference.Software;
+        }
+
+        if (_menuTextureUploadDirectItem is not null)
+        {
+            _menuTextureUploadDirectItem.IsChecked = state.TextureUploadMode == MenuTextureUploadMode.DirectGpu;
+        }
+
+        if (_menuTextureUploadCompatibilityItem is not null)
+        {
+            _menuTextureUploadCompatibilityItem.IsChecked = state.TextureUploadMode == MenuTextureUploadMode.CompatibilityCopy;
         }
 
         if (_menuWorkflowQualitySpeedItem is not null)
@@ -650,6 +671,23 @@ internal sealed class MainWindowNativeMenuCoordinator
         rendererMenu.Menu.Add(_menuRendererMetalItem);
         rendererMenu.Menu.Add(_menuRendererSoftwareItem);
         viewMenu.Menu.Add(rendererMenu);
+        var textureUploadMenu = new NativeMenuItem("Texture Upload")
+        {
+            Menu = new NativeMenu()
+        };
+        _menuTextureUploadDirectItem = CreateNativeMenuItem(
+            "Direct GPU Upload",
+            null,
+            _actions.OnTextureUploadDirectClicked,
+            toggleType: NativeMenuItemToggleType.CheckBox);
+        _menuTextureUploadCompatibilityItem = CreateNativeMenuItem(
+            "Compatibility Copy Upload",
+            null,
+            _actions.OnTextureUploadCompatibilityClicked,
+            toggleType: NativeMenuItemToggleType.CheckBox);
+        textureUploadMenu.Menu!.Add(_menuTextureUploadDirectItem);
+        textureUploadMenu.Menu.Add(_menuTextureUploadCompatibilityItem);
+        viewMenu.Menu.Add(textureUploadMenu);
         viewMenu.Menu.Add(new NativeMenuItemSeparator());
         _menuFullscreenItem = CreateNativeMenuItem(
             "Enter Full Screen",

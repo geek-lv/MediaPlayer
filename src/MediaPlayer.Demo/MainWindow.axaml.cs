@@ -1129,6 +1129,8 @@ public partial class MainWindow : Window
             OnRendererVulkanClicked = OnRendererVulkanClicked,
             OnRendererMetalClicked = OnRendererMetalClicked,
             OnRendererSoftwareClicked = OnRendererSoftwareClicked,
+            OnTextureUploadDirectClicked = OnTextureUploadDirectClicked,
+            OnTextureUploadCompatibilityClicked = OnTextureUploadCompatibilityClicked,
             OnToggleFullScreenClicked = OnToggleFullScreenFromMenuClicked,
             OnShowMovieInspectorClicked = OnShowMovieInspectorClicked,
             OnMinimizeClicked = OnMinimizeClicked,
@@ -1155,6 +1157,9 @@ public partial class MainWindow : Window
             TimeDisplayMode: _timeDisplayMode,
             LayoutMode: Player.LayoutMode,
             PlaybackRate: Player.PlaybackRate,
+            TextureUploadMode: Player.PreferDirectGpuTextureUpload
+                ? MenuTextureUploadMode.DirectGpu
+                : MenuTextureUploadMode.CompatibilityCopy,
             RendererPreference: RendererPreferenceState.EffectivePreference,
             WorkflowQualityProfile: _workflowQualityProfile);
     }
@@ -2468,6 +2473,10 @@ public partial class MainWindow : Window
 
     private void OnRendererSoftwareClicked(object? sender, EventArgs e) => ApplyRendererPreference(RendererPreference.Software);
 
+    private void OnTextureUploadDirectClicked(object? sender, EventArgs e) => ApplyTextureUploadMode(preferDirectGpuUpload: true);
+
+    private void OnTextureUploadCompatibilityClicked(object? sender, EventArgs e) => ApplyTextureUploadMode(preferDirectGpuUpload: false);
+
     private void ApplyRendererPreference(RendererPreference preference)
     {
         if (!RendererPreferenceState.SavePreference(preference, out var error))
@@ -2478,6 +2487,22 @@ public partial class MainWindow : Window
 
         UpdateNativeMenuState();
         ViewModel.Status = $"Renderer preference set to {RendererPreferenceState.ToDisplayName(preference)}. Restart app to apply (runtime playback surface uses OpenGL).";
+        ShowOverlayAndRestartIdleTimer();
+    }
+
+    private void ApplyTextureUploadMode(bool preferDirectGpuUpload)
+    {
+        if (Player.PreferDirectGpuTextureUpload == preferDirectGpuUpload)
+        {
+            UpdateNativeMenuState();
+            return;
+        }
+
+        Player.PreferDirectGpuTextureUpload = preferDirectGpuUpload;
+        UpdateNativeMenuState();
+        ViewModel.Status = preferDirectGpuUpload
+            ? "Texture upload mode set to Direct GPU Upload."
+            : "Texture upload mode set to Compatibility Copy Upload.";
         ShowOverlayAndRestartIdleTimer();
     }
 
