@@ -40,6 +40,9 @@ public sealed class GpuMediaPlayer : OpenGlControlBase, IDisposable
     public static readonly StyledProperty<VideoLayoutMode> LayoutModeProperty =
         AvaloniaProperty.Register<GpuMediaPlayer, VideoLayoutMode>(nameof(LayoutMode), VideoLayoutMode.Fit);
 
+    public static readonly StyledProperty<bool> PreferDirectGpuTextureUploadProperty =
+        AvaloniaProperty.Register<GpuMediaPlayer, bool>(nameof(PreferDirectGpuTextureUpload), true);
+
     public static readonly DirectProperty<GpuMediaPlayer, bool> IsPlayingProperty =
         AvaloniaProperty.RegisterDirect<GpuMediaPlayer, bool>(
             nameof(IsPlaying),
@@ -172,6 +175,7 @@ public sealed class GpuMediaPlayer : OpenGlControlBase, IDisposable
         _backend.SetLooping(IsLooping);
         _backend.SetPlaybackRate(Math.Clamp(PlaybackRate, 0.1d, 16d));
         _renderer.SetLayoutMode(LayoutMode);
+        _renderer.SetPreferDirectGpuTextureUpload(PreferDirectGpuTextureUpload);
 
     }
 
@@ -215,6 +219,12 @@ public sealed class GpuMediaPlayer : OpenGlControlBase, IDisposable
     {
         get => GetValue(LayoutModeProperty);
         set => SetValue(LayoutModeProperty, value);
+    }
+
+    public bool PreferDirectGpuTextureUpload
+    {
+        get => GetValue(PreferDirectGpuTextureUploadProperty);
+        set => SetValue(PreferDirectGpuTextureUploadProperty, value);
     }
 
     public bool IsPlaying
@@ -490,6 +500,11 @@ public sealed class GpuMediaPlayer : OpenGlControlBase, IDisposable
         else if (change.Property == LayoutModeProperty)
         {
             _renderer.SetLayoutMode(LayoutMode);
+            RequestRender();
+        }
+        else if (change.Property == PreferDirectGpuTextureUploadProperty)
+        {
+            _renderer.SetPreferDirectGpuTextureUpload(PreferDirectGpuTextureUpload);
             RequestRender();
         }
 

@@ -12,6 +12,8 @@ internal sealed class OpenGlVideoRenderer
     private const int GlTextureWrapT = 0x2803;
     private const int GlClampToEdge = 0x812F;
     private const int GlDynamicDraw = 0x88E8;
+    private const int GlUnpackAlignment = 0x0CF5;
+    private const int GlUnpackRowLength = 0x0CF2;
 
     private int _program;
     private int _vertexShader;
@@ -35,6 +37,8 @@ internal sealed class OpenGlVideoRenderer
     private byte[]? _strideCopyBuffer;
     private bool _initialized;
     private GlVersion _glVersion;
+    private bool _preferDirectGpuTextureUpload = true;
+    private bool _supportsUnpackRowLength;
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private unsafe delegate void GlGenVertexArraysDelegate(int n, uint* arrays);
@@ -60,11 +64,19 @@ internal sealed class OpenGlVideoRenderer
         int type,
         IntPtr pixels);
 
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate void GlPixelStoreiDelegate(int pname, int param);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private unsafe delegate void GlGetIntegervDelegate(int pname, int* data);
+
     private GlGenVertexArraysDelegate? _glGenVertexArrays;
     private GlBindVertexArrayDelegate? _glBindVertexArray;
     private GlDeleteVertexArraysDelegate? _glDeleteVertexArrays;
     private GlUniform1iDelegate? _glUniform1i;
     private GlTexSubImage2DDelegate? _glTexSubImage2D;
+    private GlPixelStoreiDelegate? _glPixelStorei;
+    private GlGetIntegervDelegate? _glGetIntegerv;
 
     public void Initialize(GlInterface gl, GlVersion glVersion)
     {
@@ -92,6 +104,9 @@ internal sealed class OpenGlVideoRenderer
         _samplerUniformLocation = gl.GetUniformLocationString(_program, "uTex");
         _glUniform1i = TryLoadDelegate<GlUniform1iDelegate>(gl, "glUniform1i");
         _glTexSubImage2D = TryLoadDelegate<GlTexSubImage2DDelegate>(gl, "glTexSubImage2D");
+        _glPixelStorei = TryLoadDelegate<GlPixelStoreiDelegate>(gl, "glPixelStorei");
+        _glGetIntegerv = TryLoadDelegate<GlGetIntegervDelegate>(gl, "glGetIntegerv");
+        _supportsUnpackRowLength = SupportsUnpackRowLength();
 
         _vertexBuffer = gl.GenBuffer();
         _texture = gl.GenTexture();
@@ -163,6 +178,10 @@ internal sealed class OpenGlVideoRenderer
         if (frame.Stride == tightStride)
         {
             UploadTextureData(gl, frame.Width, frame.Height, pixelFormat, frame.Data);
+        }
+        else if (_preferDirectGpuTextureUpload && TryUploadFrameWithUnpackRowLength(gl, frame, pixelFormat))
+        {
+            // Direct texture upload path. No intermediate stride repack buffer needed.
         }
         else
         {
@@ -323,6 +342,11 @@ internal sealed class OpenGlVideoRenderer
         _quadDirty = true;
     }
 
+    public void SetPreferDirectGpuTextureUpload(bool enabled)
+    {
+        _preferDirectGpuTextureUpload = enabled;
+    }
+
     private static T? TryLoadDelegate<T>(GlInterface gl, string proc) where T : class
     {
         var address = gl.GetProcAddress(proc);
@@ -353,6 +377,44 @@ internal sealed class OpenGlVideoRenderer
             }
 
             UploadTextureData(gl, frame.Width, frame.Height, pixelFormat, new IntPtr(dstBase));
+        }
+    }
+
+    private unsafe bool TryUploadFrameWithUnpackRowLength(GlInterface gl, in MediaFrameLease frame, int pixelFormat)
+    {
+        if (!_supportsUnpackRowLength || _glPixelStorei is null)
+        {
+            return false;
+        }
+
+        var tightStride = frame.Width * 4;
+        if (frame.Stride <= 0 || frame.Stride < tightStride || (frame.Stride % 4) != 0)
+        {
+            return false;
+        }
+
+        var rowLengthPixels = frame.Stride / 4;
+        var previousAlignment = 4;
+        var previousRowLength = 0;
+
+        if (_glGetIntegerv is not null)
+        {
+            _glGetIntegerv(GlUnpackAlignment, &previousAlignment);
+            _glGetIntegerv(GlUnpackRowLength, &previousRowLength);
+        }
+
+        _glPixelStorei(GlUnpackAlignment, 1);
+        _glPixelStorei(GlUnpackRowLength, rowLengthPixels);
+
+        try
+        {
+            UploadTextureData(gl, frame.Width, frame.Height, pixelFormat, frame.Data);
+            return true;
+        }
+        finally
+        {
+            _glPixelStorei(GlUnpackRowLength, previousRowLength);
+            _glPixelStorei(GlUnpackAlignment, previousAlignment);
         }
     }
 
@@ -461,6 +523,21 @@ internal sealed class OpenGlVideoRenderer
         {
             throw new InvalidOperationException("OpenGlVideoRenderer must be initialized before rendering.");
         }
+    }
+
+    private bool SupportsUnpackRowLength()
+    {
+        if (_glPixelStorei is null)
+        {
+            return false;
+        }
+
+        if (_glVersion.Type != GlProfileType.OpenGLES)
+        {
+            return true;
+        }
+
+        return _glVersion.Major >= 3;
     }
 
     private static string GetVertexShaderSource(GlVersion glVersion)
