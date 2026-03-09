@@ -103,10 +103,17 @@ jobs:
           retention-days: 14
 
       - name: Publish to NuGet
-        if: ${{ github.ref_type == 'tag' && secrets.NUGET_API_KEY != '' }}
+        if: ${{ github.ref_type == 'tag' }}
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+        shell: bash
         run: |
-          dotnet nuget push "artifacts/packages/*.nupkg" --api-key "${{ secrets.NUGET_API_KEY }}" --source https://api.nuget.org/v3/index.json --skip-duplicate
-          dotnet nuget push "artifacts/packages/*.snupkg" --api-key "${{ secrets.NUGET_API_KEY }}" --source https://api.nuget.org/v3/index.json --skip-duplicate
+          if [ -z "${NUGET_API_KEY}" ]; then
+            echo "NUGET_API_KEY is not configured. Skipping NuGet publish."
+            exit 0
+          fi
+          dotnet nuget push "artifacts/packages/*.nupkg" --api-key "${NUGET_API_KEY}" --source https://api.nuget.org/v3/index.json --skip-duplicate
+          dotnet nuget push "artifacts/packages/*.snupkg" --api-key "${NUGET_API_KEY}" --source https://api.nuget.org/v3/index.json --skip-duplicate
 
       - name: Create GitHub release
         if: ${{ github.ref_type == 'tag' }}
