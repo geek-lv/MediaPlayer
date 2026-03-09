@@ -21,6 +21,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\MediaPlayer.Controls\MediaPlayer.Controls.csproj" />
+    <ProjectReference Include="..\MediaPlayer.TestShim\MediaPlayer.TestShim.csproj" ReferenceOutputAssembly="false" />
   </ItemGroup>
 
 </Project>

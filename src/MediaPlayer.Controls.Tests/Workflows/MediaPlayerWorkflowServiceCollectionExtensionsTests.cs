@@ -2,6 +2,7 @@ using System;
 using System.IO;
 using System.Runtime.InteropServices;
 using MediaPlayer.Controls;
+using MediaPlayer.Controls.Tests;
 using MediaPlayer.Controls.Workflows;
 using MediaPlayer.Native.Abstractions;
 using Microsoft.Extensions.DependencyInjection;
@@ -165,11 +166,12 @@ public sealed class MediaPlayerWorkflowServiceCollectionExtensionsTests
 
         string helperDllPath = Path.Combine(helperRoot, "fake-helper.dll");
         await File.WriteAllTextAsync(helperDllPath, "fake dll payload");
-        string helperHostPath = Path.Combine(helperRoot, "dotnet.cmd");
-        File.WriteAllText(helperHostPath, BuildDotnetShimBatch(fake.LogPath));
+        string helperHostPath = TestProcessShimLocator.CreateAliasExecutable("dotnet", helperRoot);
 
         string? originalDotnetHost = Environment.GetEnvironmentVariable(ProcessCommandResolver.DotnetHostEnvVar);
+        string? originalDotnetLogPath = Environment.GetEnvironmentVariable(TestProcessShimLocator.DotnetLogEnvVar);
         Environment.SetEnvironmentVariable(ProcessCommandResolver.DotnetHostEnvVar, helperHostPath);
+        Environment.SetEnvironmentVariable(TestProcessShimLocator.DotnetLogEnvVar, fake.LogPath);
         try
         {
             IMediaWorkflowService fallback = new FfmpegMediaWorkflowService();
@@ -199,6 +201,7 @@ public sealed class MediaPlayerWorkflowServiceCollectionExtensionsTests
         finally
         {
             Environment.SetEnvironmentVariable(ProcessCommandResolver.DotnetHostEnvVar, originalDotnetHost);
+            Environment.SetEnvironmentVariable(TestProcessShimLocator.DotnetLogEnvVar, originalDotnetLogPath);
         }
     }
 
@@ -255,33 +258,6 @@ public sealed class MediaPlayerWorkflowServiceCollectionExtensionsTests
                 // Best effort temp workspace cleanup.
             }
         }
-    }
-
-    private static string BuildDotnetShimBatch(string logPath)
-    {
-        return "@echo off\r\n" +
-               "setlocal EnableDelayedExpansion\r\n" +
-               "set \"log=" + logPath.Replace("\"", "\"\"") + "\"\r\n" +
-               "set \"outputPath=\"\r\n" +
-               "if not exist \"%log%\" type nul > \"%log%\"\r\n" +
-               ">>\"%log%\" echo ---CALL---\r\n" +
-               ":loop\r\n" +
-               "if \"%~1\"==\"\" goto end\r\n" +
-               ">>\"%log%\" echo %~1\r\n" +
-               "if /I \"%~1\"==\"--output\" (\r\n" +
-                "  shift\r\n" +
-               "  if not \"%~1\"==\"\" (\r\n" +
-               "    set \"outputPath=%~1\"\r\n" +
-               "    >>\"%log%\" echo %~1\r\n" +
-               "  )\r\n" +
-               "  shift\r\n" +
-               "  goto loop\r\n" +
-               ")\r\n" +
-               "shift\r\n" +
-               "goto loop\r\n" +
-               ":end\r\n" +
-               "if not \"%outputPath%\"==\"\" type nul > \"%outputPath%\"\r\n" +
-               "exit /b 0\r\n";
     }
 
     private sealed class FakeWorkflowService : IMediaWorkflowService

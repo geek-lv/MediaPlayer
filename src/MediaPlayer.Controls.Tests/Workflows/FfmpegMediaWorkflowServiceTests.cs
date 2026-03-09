@@ -3,9 +3,9 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Runtime.InteropServices;
-using System.Text;
 using System.Threading.Tasks;
 using MediaPlayer.Controls;
+using MediaPlayer.Controls.Tests;
 using MediaPlayer.Controls.Workflows;
 using Xunit;
 
@@ -411,7 +411,6 @@ public sealed class FfmpegMediaWorkflowServiceTests
 
         private static readonly IReadOnlyList<string> ManagedEnvironmentKeys = new[]
         {
-            "PATH",
             ProcessCommandResolver.FfmpegPathEnvVar,
             "FAKE_FFMPEG_LOG",
             "FAKE_FFMPEG_STATE",
@@ -433,27 +432,13 @@ public sealed class FfmpegMediaWorkflowServiceTests
             LogPath = Path.Combine(RootDirectory, "ffmpeg.log");
             StatePath = Path.Combine(RootDirectory, "ffmpeg.state");
 
-            string executablePath = Path.Combine(binDirectory, RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "ffmpeg.cmd" : "ffmpeg");
-            string script = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? BuildWindowsScript() : BuildUnixScript();
-            File.WriteAllText(executablePath, script, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
-
-            if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-            {
-                File.SetUnixFileMode(executablePath,
-                    UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute |
-                    UnixFileMode.GroupRead | UnixFileMode.GroupExecute |
-                    UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
-            }
+            string executablePath = TestProcessShimLocator.CreateAliasExecutable("ffmpeg", binDirectory);
 
             foreach (string key in ManagedEnvironmentKeys)
             {
                 _originalEnvironment[key] = Environment.GetEnvironmentVariable(key);
             }
 
-            string originalPath = _originalEnvironment["PATH"] ?? string.Empty;
-            Environment.SetEnvironmentVariable("PATH", string.IsNullOrEmpty(originalPath)
-                ? binDirectory
-                : string.Concat(binDirectory, Path.PathSeparator, originalPath));
             Environment.SetEnvironmentVariable(ProcessCommandResolver.FfmpegPathEnvVar, executablePath);
             Environment.SetEnvironmentVariable("FAKE_FFMPEG_LOG", LogPath);
             Environment.SetEnvironmentVariable("FAKE_FFMPEG_STATE", StatePath);
@@ -516,79 +501,6 @@ public sealed class FfmpegMediaWorkflowServiceTests
             {
                 // Best effort cleanup of temporary fake ffmpeg workspace.
             }
-        }
-
-        private static string BuildUnixScript()
-        {
-            return "#!/bin/sh\n" +
-                "set -eu\n" +
-                "log=\"${FAKE_FFMPEG_LOG}\"\n" +
-                "state=\"${FAKE_FFMPEG_STATE}\"\n" +
-                "printf '%s\\n' '---CALL---' >> \"$log\"\n" +
-                "last=''\n" +
-                "for arg in \"$@\"; do\n" +
-                "  last=\"$arg\"\n" +
-                "  printf '%s\\n' \"$arg\" >> \"$log\"\n" +
-                "done\n" +
-                "exit_code=\"${FAKE_FFMPEG_EXIT_CODE:-0}\"\n" +
-                "if [ \"${FAKE_FFMPEG_FAIL_FIRST:-0}\" = '1' ]; then\n" +
-                "  count=0\n" +
-                "  if [ -f \"$state\" ]; then\n" +
-                "    count=$(cat \"$state\")\n" +
-                "  fi\n" +
-                "  count=$((count + 1))\n" +
-                "  printf '%s' \"$count\" > \"$state\"\n" +
-                "  if [ \"$count\" -eq 1 ]; then\n" +
-                "    exit_code=1\n" +
-                "  else\n" +
-                "    exit_code=0\n" +
-                "  fi\n" +
-                "fi\n" +
-                "if [ \"${FAKE_FFMPEG_CREATE_PARTIAL:-0}\" = '1' ] && [ -n \"$last\" ]; then\n" +
-                "  printf 'partial' > \"$last\"\n" +
-                "fi\n" +
-                "if [ \"${FAKE_FFMPEG_TOUCH_OUTPUT:-0}\" = '1' ] && [ \"$exit_code\" -eq 0 ] && [ -n \"$last\" ]; then\n" +
-                "  : > \"$last\"\n" +
-                "fi\n" +
-                "exit \"$exit_code\"\n";
-        }
-
-        private static string BuildWindowsScript()
-        {
-            return "@echo off\r\n" +
-                "setlocal EnableDelayedExpansion\r\n" +
-                "set \"log=%FAKE_FFMPEG_LOG%\"\r\n" +
-                "set \"state=%FAKE_FFMPEG_STATE%\"\r\n" +
-                "if not exist \"%log%\" type nul > \"%log%\"\r\n" +
-                ">>\"%log%\" echo ---CALL---\r\n" +
-                "set \"last=\"\r\n" +
-                ":loop\r\n" +
-                "if \"%~1\"==\"\" goto afterargs\r\n" +
-                "set \"last=%~1\"\r\n" +
-                ">>\"%log%\" echo %~1\r\n" +
-                "shift\r\n" +
-                "goto loop\r\n" +
-                ":afterargs\r\n" +
-                "set \"exit_code=%FAKE_FFMPEG_EXIT_CODE%\"\r\n" +
-                "if \"%exit_code%\"==\"\" set \"exit_code=0\"\r\n" +
-                "if \"%FAKE_FFMPEG_FAIL_FIRST%\"==\"1\" (\r\n" +
-                "  set \"count=0\"\r\n" +
-                "  if exist \"%state%\" set /p count=<\"%state%\"\r\n" +
-                "  set /a count=count+1\r\n" +
-                "  >\"%state%\" echo !count!\r\n" +
-                "  if !count! EQU 1 (\r\n" +
-                "    set \"exit_code=1\"\r\n" +
-                "  ) else (\r\n" +
-                "    set \"exit_code=0\"\r\n" +
-                "  )\r\n" +
-                ")\r\n" +
-                "if \"%FAKE_FFMPEG_CREATE_PARTIAL%\"==\"1\" if not \"%last%\"==\"\" (\r\n" +
-                "  >\"%last%\" echo partial\r\n" +
-                ")\r\n" +
-                "if \"%FAKE_FFMPEG_TOUCH_OUTPUT%\"==\"1\" if not \"%last%\"==\"\" if \"%exit_code%\"==\"0\" (\r\n" +
-                "  type nul > \"%last%\"\r\n" +
-                ")\r\n" +
-                "exit /b %exit_code%\r\n";
         }
     }
 }
