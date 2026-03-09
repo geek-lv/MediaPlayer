@@ -15,7 +15,6 @@ namespace MediaPlayer.Controls.Backends;
 internal class FfmpegMediaBackend : IMediaBackend, IMediaAudioCapabilityProvider, IMediaAudioPlaybackController, IMediaAudioDeviceController
 {
     private static readonly IReadOnlyList<MediaTrackInfo> s_emptyTracks = Array.Empty<MediaTrackInfo>();
-    private static readonly bool s_ffplayAvailable = IsToolAvailable("ffplay");
     private static readonly IReadOnlyList<MediaAudioDeviceInfo> s_defaultInputDevices = MediaAudioDeviceCatalog.CreateDefaultInputDevices("ffmpeg");
     private static readonly IReadOnlyList<MediaAudioDeviceInfo> s_defaultOutputDevices = MediaAudioDeviceCatalog.CreateDefaultOutputDevices("ffmpeg");
     private readonly object _frameGate = new();
@@ -78,7 +77,7 @@ internal class FfmpegMediaBackend : IMediaBackend, IMediaAudioCapabilityProvider
     {
         _profile = profile;
         _decodeMode = profile.SupportsHardwareAcceleration ? DecodeMode.Hardware : DecodeMode.Software;
-        _ffplayAvailable = s_ffplayAvailable;
+        _ffplayAvailable = IsToolAvailable(ProcessCommandResolver.ResolveFfplayExecutable());
     }
 
     public event EventHandler? FrameReady;
@@ -1078,12 +1077,12 @@ internal class FfmpegMediaBackend : IMediaBackend, IMediaAudioCapabilityProvider
     {
         var psi = new ProcessStartInfo
         {
-            FileName = "ffmpeg",
             UseShellExecute = false,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             CreateNoWindow = true
         };
+        ProcessCommandResolver.ConfigureTool(psi, ProcessCommandResolver.ResolveFfmpegExecutable());
 
         psi.ArgumentList.Add("-hide_banner");
         psi.ArgumentList.Add("-loglevel");
@@ -1192,12 +1191,12 @@ internal class FfmpegMediaBackend : IMediaBackend, IMediaAudioCapabilityProvider
     {
         var psi = new ProcessStartInfo
         {
-            FileName = "ffmpeg",
             UseShellExecute = false,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             CreateNoWindow = true
         };
+        ProcessCommandResolver.ConfigureTool(psi, ProcessCommandResolver.ResolveFfmpegExecutable());
 
         psi.ArgumentList.Add("-hide_banner");
         psi.ArgumentList.Add("-loglevel");
@@ -1296,12 +1295,12 @@ internal class FfmpegMediaBackend : IMediaBackend, IMediaAudioCapabilityProvider
 
             var psi = new ProcessStartInfo
             {
-                FileName = "ffplay",
                 UseShellExecute = false,
                 RedirectStandardOutput = false,
                 RedirectStandardError = false,
                 CreateNoWindow = true
             };
+            ProcessCommandResolver.ConfigureTool(psi, ProcessCommandResolver.ResolveFfplayExecutable());
 
             psi.ArgumentList.Add("-loglevel");
             psi.ArgumentList.Add("quiet");
@@ -1538,7 +1537,7 @@ internal class FfmpegMediaBackend : IMediaBackend, IMediaAudioCapabilityProvider
         subtitleTracks = [];
         error = string.Empty;
 
-        if (!IsToolAvailable("ffprobe"))
+        if (!IsToolAvailable(ProcessCommandResolver.ResolveFfprobeExecutable()))
         {
             error = "ffprobe is required for FFmpeg fallback backend.";
             return false;
@@ -1546,12 +1545,12 @@ internal class FfmpegMediaBackend : IMediaBackend, IMediaAudioCapabilityProvider
 
         var psi = new ProcessStartInfo
         {
-            FileName = "ffprobe",
             UseShellExecute = false,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             CreateNoWindow = true
         };
+        ProcessCommandResolver.ConfigureTool(psi, ProcessCommandResolver.ResolveFfprobeExecutable());
 
         psi.ArgumentList.Add("-v");
         psi.ArgumentList.Add("error");
@@ -1823,19 +1822,19 @@ internal class FfmpegMediaBackend : IMediaBackend, IMediaAudioCapabilityProvider
         return builder.ToString();
     }
 
-    private static bool IsToolAvailable(string toolName)
+    private static bool IsToolAvailable(string toolPathOrCommand)
     {
         try
         {
             var psi = new ProcessStartInfo
             {
-                FileName = toolName,
-                ArgumentList = { "-version" },
                 UseShellExecute = false,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 CreateNoWindow = true
             };
+            ProcessCommandResolver.ConfigureTool(psi, toolPathOrCommand);
+            psi.ArgumentList.Add("-version");
 
             using var process = Process.Start(psi);
             if (process is null)
@@ -1871,7 +1870,7 @@ internal class FfmpegMediaBackend : IMediaBackend, IMediaAudioCapabilityProvider
 
     internal static bool IsAudioPlaybackAvailable()
     {
-        return s_ffplayAvailable;
+        return IsToolAvailable(ProcessCommandResolver.ResolveFfplayExecutable());
     }
 
     private static string BuildAtempoFilter(double playbackRate)
