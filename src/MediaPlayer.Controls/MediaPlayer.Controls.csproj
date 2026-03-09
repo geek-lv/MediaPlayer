@@ -6,12 +6,17 @@
     <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <AvaloniaUseCompiledBindingsByDefault>true</AvaloniaUseCompiledBindingsByDefault>
+    <IsPackable>true</IsPackable>
+    <PackageId>MediaPlayer.Controls</PackageId>
+    <Title>MediaPlayer Controls</Title>
+    <Description>GPU-accelerated Avalonia media playback controls with no-airspace rendering, native backend selection, and reusable QuickTime-style playback workflows.</Description>
+    <PackageTags>$(PackageTags);avalonia-controls;gpu-rendering</PackageTags>
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Avalonia" Version="11.3.12" />
-    <PackageReference Include="LibVLCSharp" Version="3.9.6" />
-    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="9.0.8" />
+    <PackageReference Include="Avalonia" />
+    <PackageReference Include="LibVLCSharp" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" />
   </ItemGroup>
 
   <ItemGroup>

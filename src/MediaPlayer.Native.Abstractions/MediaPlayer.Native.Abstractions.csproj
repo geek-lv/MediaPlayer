@@ -4,6 +4,11 @@
     <TargetFramework>net9.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <IsPackable>true</IsPackable>
+    <PackageId>MediaPlayer.Native.Abstractions</PackageId>
+    <Title>MediaPlayer Native Abstractions</Title>
+    <Description>Shared contracts, diagnostics, capability models, and provider selection abstractions for MediaPlayer native playback and workflow integrations.</Description>
+    <PackageTags>$(PackageTags);abstractions;native-backends</PackageTags>
   </PropertyGroup>
 
 </Project>

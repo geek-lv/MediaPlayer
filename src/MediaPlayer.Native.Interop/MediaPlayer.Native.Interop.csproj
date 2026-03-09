@@ -4,6 +4,11 @@
     <TargetFramework>net9.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <IsPackable>true</IsPackable>
+    <PackageId>MediaPlayer.Native.Interop</PackageId>
+    <Title>MediaPlayer Native Interop</Title>
+    <Description>Managed interop provider catalogs and runtime helpers for MediaPlayer native playback and media workflow backends.</Description>
+    <PackageTags>$(PackageTags);interop;native-playback</PackageTags>
   </PropertyGroup>
 
   <ItemGroup>

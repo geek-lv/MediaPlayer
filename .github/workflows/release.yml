@@ -1,0 +1,118 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  DOTNET_VERSION: '9.0.x'
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+
+jobs:
+  test:
+    name: Validate (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Restore
+        run: dotnet restore MediaPlayer.sln
+
+      - name: Build
+        run: dotnet build MediaPlayer.sln -c Release --no-restore -warnaserror
+
+      - name: Test Controls
+        run: dotnet test src/MediaPlayer.Controls.Tests/MediaPlayer.Controls.Tests.csproj -c Release --no-build --logger "trx;LogFileName=controls-tests.trx" --results-directory ./artifacts/test-results
+
+      - name: Test Demo
+        run: dotnet test src/MediaPlayer.Demo.Tests/MediaPlayer.Demo.Tests.csproj -c Release --no-build --logger "trx;LogFileName=demo-tests.trx" --results-directory ./artifacts/test-results
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-test-results-${{ matrix.os }}
+          path: artifacts/test-results/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  pack-and-publish:
+    name: Pack & Publish
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="0.1.0-preview.${GITHUB_RUN_NUMBER}"
+          fi
+          echo "value=${version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Restore
+        run: dotnet restore MediaPlayer.sln
+
+      - name: Build
+        run: dotnet build MediaPlayer.sln -c Release --no-restore -warnaserror /p:Version=${{ steps.version.outputs.value }}
+
+      - name: Pack MediaPlayer.Controls
+        run: dotnet pack src/MediaPlayer.Controls/MediaPlayer.Controls.csproj -c Release --no-build -o ./artifacts/packages /p:Version=${{ steps.version.outputs.value }}
+
+      - name: Pack MediaPlayer.Native.Abstractions
+        run: dotnet pack src/MediaPlayer.Native.Abstractions/MediaPlayer.Native.Abstractions.csproj -c Release --no-build -o ./artifacts/packages /p:Version=${{ steps.version.outputs.value }}
+
+      - name: Pack MediaPlayer.Native.Interop
+        run: dotnet pack src/MediaPlayer.Native.Interop/MediaPlayer.Native.Interop.csproj -c Release --no-build -o ./artifacts/packages /p:Version=${{ steps.version.outputs.value }}
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: nuget-packages-${{ steps.version.outputs.value }}
+          path: artifacts/packages/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish to NuGet
+        if: ${{ github.ref_type == 'tag' && secrets.NUGET_API_KEY != '' }}
+        run: |
+          dotnet nuget push "artifacts/packages/*.nupkg" --api-key "${{ secrets.NUGET_API_KEY }}" --source https://api.nuget.org/v3/index.json --skip-duplicate
+          dotnet nuget push "artifacts/packages/*.snupkg" --api-key "${{ secrets.NUGET_API_KEY }}" --source https://api.nuget.org/v3/index.json --skip-duplicate
+
+      - name: Create GitHub release
+        if: ${{ github.ref_type == 'tag' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/packages/*.nupkg
+            artifacts/packages/*.snupkg
+          generate_release_notes: true

@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_VERSION: '9.0.x'
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+
+jobs:
+  build-test:
+    name: Build & Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Restore
+        run: dotnet restore MediaPlayer.sln
+
+      - name: Build
+        run: dotnet build MediaPlayer.sln -c Release --no-restore -warnaserror
+
+      - name: Test Controls
+        run: dotnet test src/MediaPlayer.Controls.Tests/MediaPlayer.Controls.Tests.csproj -c Release --no-build --logger "trx;LogFileName=controls-tests.trx" --results-directory ./artifacts/test-results
+
+      - name: Test Demo
+        run: dotnet test src/MediaPlayer.Demo.Tests/MediaPlayer.Demo.Tests.csproj -c Release --no-build --logger "trx;LogFileName=demo-tests.trx" --results-directory ./artifacts/test-results
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.os }}
+          path: artifacts/test-results/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  pack-preview:
+    name: Pack Preview
+    runs-on: ubuntu-latest
+    needs: build-test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Restore
+        run: dotnet restore MediaPlayer.sln
+
+      - name: Build
+        run: dotnet build MediaPlayer.sln -c Release --no-restore -warnaserror
+
+      - name: Pack MediaPlayer.Controls
+        run: dotnet pack src/MediaPlayer.Controls/MediaPlayer.Controls.csproj -c Release --no-build -o ./artifacts/packages /p:VersionSuffix=ci.${{ github.run_number }}
+
+      - name: Pack MediaPlayer.Native.Abstractions
+        run: dotnet pack src/MediaPlayer.Native.Abstractions/MediaPlayer.Native.Abstractions.csproj -c Release --no-build -o ./artifacts/packages /p:VersionSuffix=ci.${{ github.run_number }}
+
+      - name: Pack MediaPlayer.Native.Interop
+        run: dotnet pack src/MediaPlayer.Native.Interop/MediaPlayer.Native.Interop.csproj -c Release --no-build -o ./artifacts/packages /p:VersionSuffix=ci.${{ github.run_number }}
+
+      - name: Upload preview packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: nuget-preview-packages
+          path: artifacts/packages/
+          if-no-files-found: error
+          retention-days: 7
