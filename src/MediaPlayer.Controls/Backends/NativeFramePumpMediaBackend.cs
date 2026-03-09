@@ -1070,14 +1070,15 @@ internal abstract class NativeFramePumpMediaBackend : IMediaBackend, IMediaAudio
 
     protected static ProcessStartInfo CreateToolProcess(string fileName)
     {
-        return new ProcessStartInfo
+        var startInfo = new ProcessStartInfo
         {
-            FileName = fileName,
             UseShellExecute = false,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             CreateNoWindow = true
         };
+        ProcessCommandResolver.ConfigureTool(startInfo, fileName);
+        return startInfo;
     }
 
     protected static string FormatMediaSource(Uri source)

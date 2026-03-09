@@ -1206,12 +1206,12 @@ public sealed class FfmpegMediaWorkflowService : IMediaWorkflowService
     {
         var psi = new ProcessStartInfo
         {
-            FileName = "ffmpeg",
             UseShellExecute = false,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             CreateNoWindow = true
         };
+        ProcessCommandResolver.ConfigureTool(psi, ProcessCommandResolver.ResolveFfmpegExecutable());
 
         psi.ArgumentList.Add("-hide_banner");
         psi.ArgumentList.Add("-loglevel");

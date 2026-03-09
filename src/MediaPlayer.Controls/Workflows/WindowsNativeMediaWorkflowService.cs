@@ -302,7 +302,7 @@ public sealed class WindowsNativeMediaWorkflowService : DelegatingMediaWorkflowS
     {
         if (string.Equals(Path.GetExtension(helperPath), ".dll", StringComparison.OrdinalIgnoreCase))
         {
-            psi.FileName = "dotnet";
+            ProcessCommandResolver.ConfigureTool(psi, ProcessCommandResolver.ResolveDotnetHost());
             psi.ArgumentList.Add(helperPath);
             return;
         }

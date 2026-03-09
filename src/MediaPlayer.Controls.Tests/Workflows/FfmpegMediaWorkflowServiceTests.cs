@@ -5,6 +5,7 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading.Tasks;
+using MediaPlayer.Controls;
 using MediaPlayer.Controls.Workflows;
 using Xunit;
 
@@ -411,6 +412,7 @@ public sealed class FfmpegMediaWorkflowServiceTests
         private static readonly IReadOnlyList<string> ManagedEnvironmentKeys = new[]
         {
             "PATH",
+            ProcessCommandResolver.FfmpegPathEnvVar,
             "FAKE_FFMPEG_LOG",
             "FAKE_FFMPEG_STATE",
             "FAKE_FFMPEG_TOUCH_OUTPUT",
@@ -452,6 +454,7 @@ public sealed class FfmpegMediaWorkflowServiceTests
             Environment.SetEnvironmentVariable("PATH", string.IsNullOrEmpty(originalPath)
                 ? binDirectory
                 : string.Concat(binDirectory, Path.PathSeparator, originalPath));
+            Environment.SetEnvironmentVariable(ProcessCommandResolver.FfmpegPathEnvVar, executablePath);
             Environment.SetEnvironmentVariable("FAKE_FFMPEG_LOG", LogPath);
             Environment.SetEnvironmentVariable("FAKE_FFMPEG_STATE", StatePath);
             Environment.SetEnvironmentVariable("FAKE_FFMPEG_TOUCH_OUTPUT", touchOutputOnSuccess ? "1" : "0");

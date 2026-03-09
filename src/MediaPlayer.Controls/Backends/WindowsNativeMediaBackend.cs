@@ -115,7 +115,7 @@ internal sealed class WindowsNativeMediaBackend : NativeFramePumpMediaBackend
 
     private static ProcessStartInfo CreateDotnetHelperProcess(string command)
     {
-        var psi = CreateToolProcess("dotnet");
+        var psi = CreateToolProcess(ProcessCommandResolver.ResolveDotnetHost());
         psi.ArgumentList.Add(s_helperDllPath!);
         psi.ArgumentList.Add(command);
         return psi;
@@ -129,12 +129,12 @@ internal sealed class WindowsNativeMediaBackend : NativeFramePumpMediaBackend
             Directory.CreateDirectory(outputDirectory);
             var psi = new ProcessStartInfo
             {
-                FileName = "dotnet",
                 UseShellExecute = false,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 CreateNoWindow = true
             };
+            ProcessCommandResolver.ConfigureTool(psi, ProcessCommandResolver.ResolveDotnetHost());
 
             psi.ArgumentList.Add("publish");
             psi.ArgumentList.Add(projectPath);
@@ -189,6 +189,7 @@ internal sealed class WindowsNativeMediaBackend : NativeFramePumpMediaBackend
     private const string WindowsHelperSource = """
 using System.Diagnostics;
 using System.Globalization;
+using System.IO;
 using System.Text.Json;
 using System.Windows;
 using System.Windows.Media;
@@ -268,103 +269,121 @@ internal static class Program
 
     private static int Probe(string source)
     {
-        using var player = CreatePlayer(source);
-        WaitForOpen(player);
+        var player = CreatePlayer(source);
+        try
+        {
+            WaitForOpen(player);
 
-        var width = Math.Max(1, player.NaturalVideoWidth);
-        var height = Math.Max(1, player.NaturalVideoHeight);
-        var duration = player.NaturalDuration.HasTimeSpan ? Math.Max(0, player.NaturalDuration.TimeSpan.TotalSeconds) : 0d;
-        var payload = JsonSerializer.Serialize(new { width, height, duration, frameRate = 0d });
-        Console.Out.Write(payload);
-        Console.Out.Flush();
-        player.Close();
-        return 0;
+            var width = Math.Max(1, player.NaturalVideoWidth);
+            var height = Math.Max(1, player.NaturalVideoHeight);
+            var duration = player.NaturalDuration.HasTimeSpan ? Math.Max(0, player.NaturalDuration.TimeSpan.TotalSeconds) : 0d;
+            var payload = JsonSerializer.Serialize(new { width, height, duration, frameRate = 0d });
+            Console.Out.Write(payload);
+            Console.Out.Flush();
+            return 0;
+        }
+        finally
+        {
+            player.Close();
+        }
     }
 
     private static int Play(string source, double startSeconds, double speed, double volume, bool muted)
     {
-        using var player = CreatePlayer(source);
-        WaitForOpen(player);
-
-        var width = Math.Max(1, player.NaturalVideoWidth);
-        var height = Math.Max(1, player.NaturalVideoHeight);
-        var frame = new byte[checked(width * height * 4)];
-        var stdout = Console.OpenStandardOutput();
-        var ended = false;
-
-        player.MediaEnded += (_, _) => ended = true;
-        player.MediaFailed += (_, e) => throw new InvalidOperationException(e.ErrorException?.Message ?? "Media playback failed.");
-        if (startSeconds > 0)
+        var player = CreatePlayer(source);
+        try
         {
-            player.Position = TimeSpan.FromSeconds(startSeconds);
-        }
+            WaitForOpen(player);
 
-        if (speed > 0)
-        {
-            player.SpeedRatio = Math.Clamp(speed, 0.1d, 16d);
-        }
+            var width = Math.Max(1, player.NaturalVideoWidth);
+            var height = Math.Max(1, player.NaturalVideoHeight);
+            var frame = new byte[checked(width * height * 4)];
+            var stdout = Console.OpenStandardOutput();
+            var ended = false;
 
-        player.Volume = Math.Clamp(volume / 100d, 0d, 1d);
-        player.IsMuted = muted;
-
-        player.Play();
-        var frameInterval = TimeSpan.FromMilliseconds(33 / Math.Max(0.1d, speed <= 0 ? 1d : speed));
-        var stopwatch = Stopwatch.StartNew();
-        var nextTick = TimeSpan.Zero;
-        while (!ended)
-        {
-            PumpDispatcherOnce();
-            if (stopwatch.Elapsed < nextTick)
+            player.MediaEnded += (_, _) => ended = true;
+            player.MediaFailed += (_, e) => throw new InvalidOperationException(e.ErrorException?.Message ?? "Media playback failed.");
+            if (startSeconds > 0)
             {
-                Thread.Sleep(1);
-                continue;
+                player.Position = TimeSpan.FromSeconds(startSeconds);
             }
 
+            if (speed > 0)
+            {
+                player.SpeedRatio = Math.Clamp(speed, 0.1d, 16d);
+            }
+
+            player.Volume = Math.Clamp(volume / 100d, 0d, 1d);
+            player.IsMuted = muted;
+
+            player.Play();
+            var frameInterval = TimeSpan.FromMilliseconds(33 / Math.Max(0.1d, speed <= 0 ? 1d : speed));
+            var stopwatch = Stopwatch.StartNew();
+            var nextTick = TimeSpan.Zero;
+            while (!ended)
+            {
+                PumpDispatcherOnce();
+                if (stopwatch.Elapsed < nextTick)
+                {
+                    Thread.Sleep(1);
+                    continue;
+                }
+
+                if (TryCaptureFrame(player, width, height, frame))
+                {
+                    stdout.Write(frame, 0, frame.Length);
+                    stdout.Flush();
+                }
+
+                nextTick += frameInterval;
+            }
+
+            return 0;
+        }
+        finally
+        {
+            player.Close();
+        }
+    }
+
+    private static int Frame(string source, double atSeconds)
+    {
+        var player = CreatePlayer(source);
+        try
+        {
+            WaitForOpen(player);
+
+            var width = Math.Max(1, player.NaturalVideoWidth);
+            var height = Math.Max(1, player.NaturalVideoHeight);
+            var frame = new byte[checked(width * height * 4)];
+            var stdout = Console.OpenStandardOutput();
+
+            if (atSeconds > 0)
+            {
+                player.Position = TimeSpan.FromSeconds(atSeconds);
+            }
+
+            player.Play();
+            var deadline = DateTime.UtcNow.AddMilliseconds(240);
+            while (DateTime.UtcNow < deadline)
+            {
+                PumpDispatcherOnce();
+                Thread.Sleep(2);
+            }
+
+            player.Pause();
             if (TryCaptureFrame(player, width, height, frame))
             {
                 stdout.Write(frame, 0, frame.Length);
                 stdout.Flush();
             }
 
-            nextTick += frameInterval;
+            return 0;
         }
-
-        player.Close();
-        return 0;
-    }
-
-    private static int Frame(string source, double atSeconds)
-    {
-        using var player = CreatePlayer(source);
-        WaitForOpen(player);
-
-        var width = Math.Max(1, player.NaturalVideoWidth);
-        var height = Math.Max(1, player.NaturalVideoHeight);
-        var frame = new byte[checked(width * height * 4)];
-        var stdout = Console.OpenStandardOutput();
-
-        if (atSeconds > 0)
+        finally
         {
-            player.Position = TimeSpan.FromSeconds(atSeconds);
+            player.Close();
         }
-
-        player.Play();
-        var deadline = DateTime.UtcNow.AddMilliseconds(240);
-        while (DateTime.UtcNow < deadline)
-        {
-            PumpDispatcherOnce();
-            Thread.Sleep(2);
-        }
-
-        player.Pause();
-        if (TryCaptureFrame(player, width, height, frame))
-        {
-            stdout.Write(frame, 0, frame.Length);
-            stdout.Flush();
-        }
-
-        player.Close();
-        return 0;
     }
 
     private static MediaPlayer CreatePlayer(string source)

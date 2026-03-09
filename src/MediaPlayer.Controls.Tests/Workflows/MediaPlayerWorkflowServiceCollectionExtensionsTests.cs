@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Runtime.InteropServices;
+using MediaPlayer.Controls;
 using MediaPlayer.Controls.Workflows;
 using MediaPlayer.Native.Abstractions;
 using Microsoft.Extensions.DependencyInjection;
@@ -164,11 +165,11 @@ public sealed class MediaPlayerWorkflowServiceCollectionExtensionsTests
 
         string helperDllPath = Path.Combine(helperRoot, "fake-helper.dll");
         await File.WriteAllTextAsync(helperDllPath, "fake dll payload");
-        string helperExePath = Path.Combine(helperRoot, "dotnet.exe");
-        File.WriteAllText(helperExePath, BuildDotnetShimBatch(fake.LogPath));
+        string helperHostPath = Path.Combine(helperRoot, "dotnet.cmd");
+        File.WriteAllText(helperHostPath, BuildDotnetShimBatch(fake.LogPath));
 
-        string originalPath = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
-        Environment.SetEnvironmentVariable("PATH", string.Concat(helperRoot, Path.PathSeparator, originalPath));
+        string? originalDotnetHost = Environment.GetEnvironmentVariable(ProcessCommandResolver.DotnetHostEnvVar);
+        Environment.SetEnvironmentVariable(ProcessCommandResolver.DotnetHostEnvVar, helperHostPath);
         try
         {
             IMediaWorkflowService fallback = new FfmpegMediaWorkflowService();
@@ -197,7 +198,7 @@ public sealed class MediaPlayerWorkflowServiceCollectionExtensionsTests
         }
         finally
         {
-            Environment.SetEnvironmentVariable("PATH", originalPath);
+            Environment.SetEnvironmentVariable(ProcessCommandResolver.DotnetHostEnvVar, originalDotnetHost);
         }
     }
 
