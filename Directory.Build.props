@@ -12,6 +12,7 @@
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
     <VersionPrefix>0.1.0</VersionPrefix>
+    <VersionSuffix>alpha.1</VersionSuffix>
     <Deterministic>true</Deterministic>
     <ContinuousIntegrationBuild Condition="'$(GITHUB_ACTIONS)' == 'true'">true</ContinuousIntegrationBuild>
     <EmbedUntrackedSources>true</EmbedUntrackedSources>
