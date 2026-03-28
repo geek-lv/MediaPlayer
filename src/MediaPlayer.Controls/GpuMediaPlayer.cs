@@ -545,9 +545,16 @@ public sealed class GpuMediaPlayer : OpenGlControlBase, IDisposable
         {
             using (frame)
             {
-                _renderer.UploadFrame(gl, frame);
+                // Phase 1: copy pixel data into renderer-owned staging buffer while the lease is held.
+                // No GL calls are made here. See OpenGlVideoRenderer.CopyFrameToStagingBuffer for
+                // the full explanation of why this two-phase approach is required (AMD GPU driver crash).
+                _renderer.CopyFrameToStagingBuffer(frame);
                 _lastRenderedFrameSequence = frame.Sequence;
             }
+            // Phase 2: upload from staging buffer to GL texture after the lease is released.
+            // The AMD driver's async AVX2 reads now target renderer-owned memory, not the backend
+            // frame buffer that may be freed or GC-moved after the lease is disposed.
+            _renderer.UploadStagedFrame(gl);
         }
 
         _renderer.Render(gl, fb, pixelWidth, pixelHeight);

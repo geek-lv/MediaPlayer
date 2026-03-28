@@ -12,8 +12,6 @@ internal sealed class OpenGlVideoRenderer
     private const int GlTextureWrapT = 0x2803;
     private const int GlClampToEdge = 0x812F;
     private const int GlDynamicDraw = 0x88E8;
-    private const int GlUnpackAlignment = 0x0CF5;
-    private const int GlUnpackRowLength = 0x0CF2;
 
     private int _program;
     private int _vertexShader;
@@ -34,11 +32,16 @@ internal sealed class OpenGlVideoRenderer
     private readonly float[] _quadVertices = new float[24];
     private bool _quadDirty = true;
     private VideoLayoutMode _layoutMode = VideoLayoutMode.Fit;
+    // Two-phase staging buffer: see CopyFrameToStagingBuffer XML doc for full explanation.
+    // Required to prevent AMD GPU driver (atio6axx.dll) crash caused by async AVX2 reads
+    // of the pixels pointer passed to glTexSubImage2D after the GCHandle pin is released.
+    private int _stagedWidth;
+    private int _stagedHeight;
+    private MediaFramePixelFormat _stagedPixelFormat;
+    private bool _stagedFrameReady;
     private byte[]? _strideCopyBuffer;
     private bool _initialized;
     private GlVersion _glVersion;
-    private bool _preferDirectGpuTextureUpload = true;
-    private bool _supportsUnpackRowLength;
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private unsafe delegate void GlGenVertexArraysDelegate(int n, uint* arrays);
@@ -64,19 +67,11 @@ internal sealed class OpenGlVideoRenderer
         int type,
         IntPtr pixels);
 
-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    private delegate void GlPixelStoreiDelegate(int pname, int param);
-
-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    private unsafe delegate void GlGetIntegervDelegate(int pname, int* data);
-
     private GlGenVertexArraysDelegate? _glGenVertexArrays;
     private GlBindVertexArrayDelegate? _glBindVertexArray;
     private GlDeleteVertexArraysDelegate? _glDeleteVertexArrays;
     private GlUniform1iDelegate? _glUniform1i;
     private GlTexSubImage2DDelegate? _glTexSubImage2D;
-    private GlPixelStoreiDelegate? _glPixelStorei;
-    private GlGetIntegervDelegate? _glGetIntegerv;
 
     public void Initialize(GlInterface gl, GlVersion glVersion)
     {
@@ -104,9 +99,6 @@ internal sealed class OpenGlVideoRenderer
         _samplerUniformLocation = gl.GetUniformLocationString(_program, "uTex");
         _glUniform1i = TryLoadDelegate<GlUniform1iDelegate>(gl, "glUniform1i");
         _glTexSubImage2D = TryLoadDelegate<GlTexSubImage2DDelegate>(gl, "glTexSubImage2D");
-        _glPixelStorei = TryLoadDelegate<GlPixelStoreiDelegate>(gl, "glPixelStorei");
-        _glGetIntegerv = TryLoadDelegate<GlGetIntegervDelegate>(gl, "glGetIntegerv");
-        _supportsUnpackRowLength = SupportsUnpackRowLength();
 
         _vertexBuffer = gl.GenBuffer();
         _texture = gl.GenTexture();
@@ -136,12 +128,29 @@ internal sealed class OpenGlVideoRenderer
         _initialized = true;
     }
 
-    public void UploadFrame(GlInterface gl, in MediaFrameLease frame)
+    /// <summary>
+    /// Phase 1 of the two-phase frame upload. Copies all pixel data from the backend frame buffer
+    /// into a renderer-owned staging buffer (<c>_strideCopyBuffer</c>) while the
+    /// <see cref="MediaFrameLease"/> is still held. No GL calls are made here.
+    /// <para>
+    /// <b>Why this is required (AMD GPU driver crash fix):</b><br/>
+    /// Certain AMD driver versions (<c>atio6axx.dll</c>) process <c>glTexSubImage2D</c>
+    /// asynchronously — the driver returns from the call but continues reading the <c>pixels</c>
+    /// CPU pointer on an internal driver thread using AVX2 instructions. If the frame lease is
+    /// released before the driver finishes its async read, <c>ReleaseFrameBuffer()</c> can
+    /// un-pin the managed <c>byte[]</c>, letting the GC move it. The driver's background read
+    /// then hits the stale (now-invalid) address, producing an access violation at
+    /// <c>0x0000000000000008</c> inside <c>atio6axx!boost::serialization::singleton::is_destroyed</c>.
+    /// By copying into a renderer-owned buffer here (while the pin is still active) and only
+    /// calling GL in <see cref="UploadStagedFrame"/> after the lease is disposed, the AMD driver's
+    /// async read targets memory that is never freed or GC-moved during an active upload.
+    /// </para>
+    /// </summary>
+    public unsafe void CopyFrameToStagingBuffer(in MediaFrameLease frame)
     {
-        EnsureInitialized();
-
-        if (frame.Width <= 0 || frame.Height <= 0)
+        if (frame.Width <= 0 || frame.Height <= 0 || frame.Data == IntPtr.Zero)
         {
+            _stagedFrameReady = false;
             return;
         }
 
@@ -152,40 +161,77 @@ internal sealed class OpenGlVideoRenderer
             _quadDirty = true;
         }
 
+        var tightStride = frame.Width * 4;
+        var requiredBytes = checked(frame.Height * tightStride);
+        if (_strideCopyBuffer is null || _strideCopyBuffer.Length < requiredBytes)
+        {
+            _strideCopyBuffer = new byte[requiredBytes];
+        }
+
+        var srcBase = (byte*)frame.Data;
+        fixed (byte* dstBase = _strideCopyBuffer)
+        {
+            if (frame.Stride == tightStride)
+            {
+                Buffer.MemoryCopy(srcBase, dstBase, requiredBytes, requiredBytes);
+            }
+            else
+            {
+                for (var y = 0; y < frame.Height; y++)
+                {
+                    Buffer.MemoryCopy(srcBase + (y * frame.Stride), dstBase + (y * tightStride), tightStride, tightStride);
+                }
+            }
+        }
+
+        _stagedWidth = frame.Width;
+        _stagedHeight = frame.Height;
+        _stagedPixelFormat = frame.PixelFormat;
+        _stagedFrameReady = true;
+    }
+
+    /// <summary>
+    /// Phase 2 of the two-phase frame upload. Uploads the pixel data previously copied by
+    /// <see cref="CopyFrameToStagingBuffer"/> into the GL texture. Must be called <b>after</b>
+    /// the <see cref="MediaFrameLease"/> has been disposed so that the AMD driver's async reads
+    /// target renderer-owned memory rather than the backend's GC-pinned frame buffer.
+    /// </summary>
+    public unsafe void UploadStagedFrame(GlInterface gl)
+    {
+        EnsureInitialized();
+
+        if (!_stagedFrameReady)
+        {
+            return;
+        }
+
+        _stagedFrameReady = false;
+
         gl.ActiveTexture(GL_TEXTURE0);
         gl.BindTexture(GL_TEXTURE_2D, _texture);
-        var pixelFormat = frame.PixelFormat == MediaFramePixelFormat.Bgra32 ? GL_BGRA : GL_RGBA;
+        var pixelFormat = _stagedPixelFormat == MediaFramePixelFormat.Bgra32 ? GL_BGRA : GL_RGBA;
 
-        if (_textureWidth != frame.Width || _textureHeight != frame.Height || _texturePixelFormat != frame.PixelFormat)
+        if (_textureWidth != _stagedWidth || _textureHeight != _stagedHeight || _texturePixelFormat != _stagedPixelFormat)
         {
             gl.TexImage2D(
                 GL_TEXTURE_2D,
                 level: 0,
                 internalFormat: GL_RGBA,
-                width: frame.Width,
-                height: frame.Height,
+                width: _stagedWidth,
+                height: _stagedHeight,
                 border: 0,
                 format: pixelFormat,
                 type: GL_UNSIGNED_BYTE,
                 data: IntPtr.Zero);
 
-            _textureWidth = frame.Width;
-            _textureHeight = frame.Height;
-            _texturePixelFormat = frame.PixelFormat;
+            _textureWidth = _stagedWidth;
+            _textureHeight = _stagedHeight;
+            _texturePixelFormat = _stagedPixelFormat;
         }
 
-        var tightStride = frame.Width * 4;
-        if (frame.Stride == tightStride)
+        fixed (byte* ptr = _strideCopyBuffer)
         {
-            UploadTextureData(gl, frame.Width, frame.Height, pixelFormat, frame.Data);
-        }
-        else if (_preferDirectGpuTextureUpload && TryUploadFrameWithUnpackRowLength(gl, frame, pixelFormat))
-        {
-            // Direct texture upload path. No intermediate stride repack buffer needed.
-        }
-        else
-        {
-            UploadFrameWithStrideCopy(gl, frame, pixelFormat, tightStride);
+            UploadTextureData(gl, _stagedWidth, _stagedHeight, pixelFormat, new IntPtr(ptr));
         }
 
         gl.BindTexture(GL_TEXTURE_2D, 0);
@@ -319,6 +365,7 @@ internal sealed class OpenGlVideoRenderer
         _quadVideoHeight = 0;
         _quadDirty = true;
         _strideCopyBuffer = null;
+        _stagedFrameReady = false;
         _initialized = false;
     }
 
@@ -329,6 +376,7 @@ internal sealed class OpenGlVideoRenderer
         _textureWidth = 0;
         _textureHeight = 0;
         _quadDirty = true;
+        _stagedFrameReady = false;
     }
 
     public void SetLayoutMode(VideoLayoutMode mode)
@@ -344,7 +392,9 @@ internal sealed class OpenGlVideoRenderer
 
     public void SetPreferDirectGpuTextureUpload(bool enabled)
     {
-        _preferDirectGpuTextureUpload = enabled;
+        // No-op: the two-phase staging buffer approach (CopyFrameToStagingBuffer +
+        // UploadStagedFrame) is always used. Direct GPU texture upload was removed to
+        // fix the AMD driver (atio6axx.dll) async AVX2 read crash.
     }
 
     private static T? TryLoadDelegate<T>(GlInterface gl, string proc) where T : class
@@ -356,66 +406,6 @@ internal sealed class OpenGlVideoRenderer
         }
 
         return Marshal.GetDelegateForFunctionPointer(address, typeof(T)) as T;
-    }
-
-    private unsafe void UploadFrameWithStrideCopy(GlInterface gl, in MediaFrameLease frame, int pixelFormat, int tightStride)
-    {
-        var requiredBytes = checked(frame.Height * tightStride);
-        if (_strideCopyBuffer is null || _strideCopyBuffer.Length < requiredBytes)
-        {
-            _strideCopyBuffer = new byte[requiredBytes];
-        }
-
-        var srcBase = (byte*)frame.Data;
-        fixed (byte* dstBase = _strideCopyBuffer)
-        {
-            for (var y = 0; y < frame.Height; y++)
-            {
-                var src = srcBase + (y * frame.Stride);
-                var dst = dstBase + (y * tightStride);
-                Buffer.MemoryCopy(src, dst, tightStride, tightStride);
-            }
-
-            UploadTextureData(gl, frame.Width, frame.Height, pixelFormat, new IntPtr(dstBase));
-        }
-    }
-
-    private unsafe bool TryUploadFrameWithUnpackRowLength(GlInterface gl, in MediaFrameLease frame, int pixelFormat)
-    {
-        if (!_supportsUnpackRowLength || _glPixelStorei is null)
-        {
-            return false;
-        }
-
-        var tightStride = frame.Width * 4;
-        if (frame.Stride <= 0 || frame.Stride < tightStride || (frame.Stride % 4) != 0)
-        {
-            return false;
-        }
-
-        var rowLengthPixels = frame.Stride / 4;
-        var previousAlignment = 4;
-        var previousRowLength = 0;
-
-        if (_glGetIntegerv is not null)
-        {
-            _glGetIntegerv(GlUnpackAlignment, &previousAlignment);
-            _glGetIntegerv(GlUnpackRowLength, &previousRowLength);
-        }
-
-        _glPixelStorei(GlUnpackAlignment, 1);
-        _glPixelStorei(GlUnpackRowLength, rowLengthPixels);
-
-        try
-        {
-            UploadTextureData(gl, frame.Width, frame.Height, pixelFormat, frame.Data);
-            return true;
-        }
-        finally
-        {
-            _glPixelStorei(GlUnpackRowLength, previousRowLength);
-            _glPixelStorei(GlUnpackAlignment, previousAlignment);
-        }
     }
 
     private void UploadTextureData(GlInterface gl, int width, int height, int pixelFormat, IntPtr data)
@@ -523,21 +513,6 @@ internal sealed class OpenGlVideoRenderer
         {
             throw new InvalidOperationException("OpenGlVideoRenderer must be initialized before rendering.");
         }
-    }
-
-    private bool SupportsUnpackRowLength()
-    {
-        if (_glPixelStorei is null)
-        {
-            return false;
-        }
-
-        if (_glVersion.Type != GlProfileType.OpenGLES)
-        {
-            return true;
-        }
-
-        return _glVersion.Major >= 3;
     }
 
     private static string GetVertexShaderSource(GlVersion glVersion)
