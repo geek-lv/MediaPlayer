@@ -1,5 +1,6 @@
 using System;
 using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
 using Avalonia.OpenGL;
 using MediaPlayer.Controls.Backends;
 using static Avalonia.OpenGL.GlConsts;
@@ -145,6 +146,21 @@ internal sealed class OpenGlVideoRenderer
     /// calling GL in <see cref="UploadStagedFrame"/> after the lease is disposed, the AMD driver's
     /// async read targets memory that is never freed or GC-moved during an active upload.
     /// </para>
+    /// <para>
+    /// <b>BGRA→RGBA conversion (Intel integrated graphics / ANGLE fix):</b><br/>
+    /// When the frame pixel format is <see cref="MediaFramePixelFormat.Bgra32"/>, the B and R
+    /// channels are swapped during the copy so that the staging buffer always holds RGBA data.
+    /// The staged format is then reported as <see cref="MediaFramePixelFormat.Rgba32"/>, which
+    /// causes <see cref="UploadStagedFrame"/> to use <c>GL_RGBA</c> rather than <c>GL_BGRA</c>
+    /// for the texture upload.<br/>
+    /// <c>GL_BGRA</c> as an external format for <c>glTexImage2D</c>/<c>glTexSubImage2D</c> is not
+    /// part of the OpenGL ES core specification. On systems where Avalonia runs through ANGLE
+    /// (which translates OpenGL ES calls to Direct3D 11) — common on Intel integrated graphics —
+    /// passing <c>GL_BGRA</c> produces a silent <c>GL_INVALID_ENUM</c> error and the texture
+    /// remains black. Converting to RGBA on the CPU (which is a cheap in-cache byte swap over
+    /// already-touched staging memory) makes the upload path universally compatible across all
+    /// GPU vendors, driver versions, and OpenGL profiles.
+    /// </para>
     /// </summary>
     public unsafe void CopyFrameToStagingBuffer(in MediaFrameLease frame)
     {
@@ -171,7 +187,15 @@ internal sealed class OpenGlVideoRenderer
         var srcBase = (byte*)frame.Data;
         fixed (byte* dstBase = _strideCopyBuffer)
         {
-            if (frame.Stride == tightStride)
+            if (frame.PixelFormat == MediaFramePixelFormat.Bgra32)
+            {
+                // Convert BGRA → RGBA while copying so that glTexSubImage2D can always use the
+                // universally-supported GL_RGBA external format instead of GL_BGRA. GL_BGRA is
+                // absent from OpenGL ES core and causes silent GL_INVALID_ENUM failures (black
+                // screen) on Intel integrated graphics running through ANGLE / Direct3D 11.
+                CopyBgraToRgba(srcBase, frame.Stride, dstBase, tightStride, frame.Width, frame.Height);
+            }
+            else if (frame.Stride == tightStride)
             {
                 Buffer.MemoryCopy(srcBase, dstBase, requiredBytes, requiredBytes);
             }
@@ -186,7 +210,11 @@ internal sealed class OpenGlVideoRenderer
 
         _stagedWidth = frame.Width;
         _stagedHeight = frame.Height;
-        _stagedPixelFormat = frame.PixelFormat;
+        // BGRA data has been converted to RGBA above; always stage as Rgba32 so that
+        // UploadStagedFrame uploads with GL_RGBA (universally supported) rather than GL_BGRA.
+        _stagedPixelFormat = frame.PixelFormat == MediaFramePixelFormat.Bgra32
+            ? MediaFramePixelFormat.Rgba32
+            : frame.PixelFormat;
         _stagedFrameReady = true;
     }
 
@@ -579,5 +607,64 @@ internal sealed class OpenGlVideoRenderer
                 outColor = vec4(c.rgb, 1.0);
             }
             """;
+    }
+
+    /// <summary>
+    /// Copies <paramref name="width"/>×<paramref name="height"/> pixels from <paramref name="src"/>
+    /// to <paramref name="dst"/>, swapping the R and B channels (BGRA→RGBA) for every pixel.
+    /// Uses hardware-accelerated SIMD (e.g., SSSE3 on x64, NEON on ARM64) when available,
+    /// processing four pixels (16 bytes) per iteration; remaining pixels are handled by a scalar loop.
+    /// </summary>
+    private static unsafe void CopyBgraToRgba(
+        byte* src, int srcStride,
+        byte* dst, int dstStride,
+        int width, int height)
+    {
+        if (Vector128.IsHardwareAccelerated)
+        {
+            // Shuffle mask: within each 4-byte BGRA pixel, swap byte 0 (B) with byte 2 (R).
+            // Applied to 16 bytes (4 pixels): [2,1,0,3, 6,5,4,7, 10,9,8,11, 14,13,12,15]
+            var shuffleMask = Vector128.Create(
+                (byte)2, 1, 0, 3,
+                      6, 5, 4, 7,
+                     10, 9, 8, 11,
+                     14, 13, 12, 15);
+
+            for (var y = 0; y < height; y++)
+            {
+                var s = src + (y * srcStride);
+                var d = dst + (y * dstStride);
+                var remaining = width;
+
+                while (remaining >= 4)
+                {
+                    // Vector128.Load / Store use Unsafe.ReadUnaligned / WriteUnaligned internally,
+                    // so no 16-byte alignment requirement is imposed on s or d.
+                    Vector128.Store(Vector128.Shuffle(Vector128.Load<byte>(s), shuffleMask), d);
+                    s += 16;
+                    d += 16;
+                    remaining -= 4;
+                }
+
+                while (remaining-- > 0)
+                {
+                    d[0] = s[2]; d[1] = s[1]; d[2] = s[0]; d[3] = s[3];
+                    s += 4;
+                    d += 4;
+                }
+            }
+        }
+        else
+        {
+            for (var y = 0; y < height; y++)
+            {
+                var s = src + (y * srcStride);
+                var d = dst + (y * dstStride);
+                for (var x = 0; x < width; x++, s += 4, d += 4)
+                {
+                    d[0] = s[2]; d[1] = s[1]; d[2] = s[0]; d[3] = s[3];
+                }
+            }
+        }
     }
 }
