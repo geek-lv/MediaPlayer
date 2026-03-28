@@ -11,6 +11,8 @@
     <Title>MediaPlayer Controls</Title>
     <Description>GPU-accelerated Avalonia media playback controls with no-airspace rendering, native backend selection, and reusable QuickTime-style playback workflows.</Description>
     <PackageTags>$(PackageTags);avalonia-controls;gpu-rendering</PackageTags>
+    <Configurations>Debug;Release</Configurations>
+    <Platforms>x64</Platforms>
   </PropertyGroup>
 
   <ItemGroup>

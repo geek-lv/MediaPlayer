@@ -9,6 +9,8 @@
     <Title>MediaPlayer Native Interop</Title>
     <Description>Managed interop provider catalogs and runtime helpers for MediaPlayer native playback and media workflow backends.</Description>
     <PackageTags>$(PackageTags);interop;native-playback</PackageTags>
+    <Configurations>Release;Debug</Configurations>
+    <Platforms>x64</Platforms>
   </PropertyGroup>
 
   <ItemGroup>
